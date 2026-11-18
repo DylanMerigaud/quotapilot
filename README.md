@@ -69,6 +69,35 @@ print(f"stay between {floor} and {ceiling} points per hour")
 
 It is a reading: it never caps or throttles anything.
 
+## On-demand reset credits
+
+Some providers grant a credit you can spend to reset an account's quota on demand. A `Credit`
+names its account, a `kind` (`"full"` clears the main weekly window, `"secondary"` clears the
+secondary window only), when it expires, how many resets are `left` and whether the provider says
+it is `usable` now. `advise_credits(accounts, credits, now, mode, demand)` says for each one
+`now`, `wait` or `unknown`, with a `reason`.
+
+In plain words: spend a credit when the window it clears is spent (at least `spent_pct`, 99) and
+its natural reset is still far (at least `credit_min_lead_h`, 24 hours), or when the credit
+expires within `credit_expiry_margin_h` (24 hours) and has something to clear. Wait otherwise:
+the window is not spent, the natural reset is close, or the pool is in `surplus` (pass the
+`forecast` mode as `mode`). A secondary credit also needs room left in the weekly window
+(`secondary_min_room_pct`) and, when you pass `demand` (account name to whether work waits),
+work waiting. An unread or unusable account gives `unknown`. A natural reset already past counts
+as refilled. Credits with nothing left or already expired are skipped.
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from quotapilot import Account, Credit, advise_credits
+
+now = datetime(2026, 11, 18, 22, 0, tzinfo=timezone.utc)
+accounts = [Account("4", 100, now + timedelta(hours=80))]
+credits = [Credit("4", "full-reset-2611", "full", now + timedelta(days=20))]
+row = advise_credits(accounts, credits, now, mode="on_track")[0]
+print(row["verdict"], row["reason"], row["gain_pct"])  # now spent_far_reset 100.0
+```
+
 ## With claude-swap
 
 quotapilot is an addon above [claude-swap](https://github.com/realiti4/claude-swap), not a

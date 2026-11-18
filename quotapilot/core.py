@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 Sample = Tuple[datetime, str, Optional[float]]
 
@@ -26,6 +26,21 @@ class Account:
 
 
 @dataclass(frozen=True)
+class Credit:
+    """A provider-granted, on-demand reset of an account's windows.
+
+    `kind` "full" clears the main (weekly) window, "secondary" clears the secondary window only.
+    """
+
+    account: str
+    id: str
+    kind: str
+    expires: datetime
+    left: int = 1
+    usable: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     """Every constant of the algorithm. Defaults: one unit is one percent point of a week."""
 
@@ -39,6 +54,9 @@ class Config:
     history_h: float = 24
     secondary_hold_h: float = 24
     short_min_h: float = 1.0
+    credit_expiry_margin_h: float = 24
+    credit_min_lead_h: float = 24
+    spent_pct: float = 99.0
 
 
 DEFAULT = Config()
@@ -423,3 +441,121 @@ def pace_band(
                 lo = mid
         ceiling = lo
     return round(floor, 2), round(ceiling, 2)
+
+
+def _aware(dt: datetime | None, what: str) -> None:
+    if dt is not None and dt.tzinfo is None:
+        raise ValueError(f"{what} must be timezone-aware")
+
+
+def _left_h(at: datetime | None, now: datetime) -> float | None:
+    return None if at is None else round(max(0.0, _hours(at - now)), 1)
+
+
+def _credit_verdict(
+    c: Credit,
+    used: float | None,
+    sec: float | None,
+    window_reset: datetime | None,
+    unread: bool,
+    now: datetime,
+    mode: str | None,
+    demand: Mapping[str, bool] | None,
+    config: Config,
+) -> tuple[str, str]:
+    """(verdict, reason) of one credit, first matching rule wins."""
+    full = c.kind == "full"
+    gain = used if full else sec
+    if unread:
+        return "unknown", "account_unread"
+    if not c.usable:
+        return "wait", "not_usable"
+    if _hours(c.expires - now) <= config.credit_expiry_margin_h:
+        if gain is not None and gain >= 1:
+            return "now", "expires_soon"
+        return "wait", "expires_no_gain"
+    lead_short = window_reset is not None and _hours(window_reset - now) < config.credit_min_lead_h
+    if full:
+        assert used is not None
+        if used < config.spent_pct:
+            return "wait", "not_spent"
+        if lead_short:
+            return "wait", "natural_reset_soon"
+        if mode == "surplus":
+            return "wait", "pool_surplus"
+        return "now", "spent_far_reset"
+    if sec is None:
+        return "wait", "no_window"
+    if sec < config.spent_pct:
+        return "wait", "not_spent"
+    if used is None or 100 - used < config.secondary_min_room_pct:
+        return "wait", "weekly_spent"
+    if lead_short:
+        return "wait", "natural_reset_soon"
+    if demand is not None and not demand.get(c.account, False):
+        return "wait", "no_demand"
+    return "now", "secondary_spent_weekly_room"
+
+
+def advise_credits(
+    accounts: Sequence[Account],
+    credits: Sequence[Credit],
+    now: datetime,
+    mode: str | None = None,
+    demand: Mapping[str, bool] | None = None,
+    config: Config = DEFAULT,
+) -> list[dict[str, Any]]:
+    """Say for each on-demand reset credit whether to spend it now or wait, and why.
+
+    A credit is worth spending when its window is spent and would otherwise stay empty for long,
+    or when it is about to expire with something to clear. `mode` is a `forecast` mode: a
+    `surplus` pool has quota to spare, so a full reset is not needed. `demand` maps an account
+    name to whether work is waiting for it (None: not checked). A natural reset at or before
+    `now` counts as refilled. Credits with nothing left or already expired are skipped.
+    """
+    _aware(now, "now")
+    for acc in accounts:
+        _aware(acc.reset, f"{acc.name} reset")
+        _aware(acc.secondary_reset, f"{acc.name} secondary_reset")
+    for c in credits:
+        _aware(c.expires, f"credit {c.id} expires")
+        if c.kind not in ("full", "secondary"):
+            raise ValueError(f"unknown credit kind: {c.kind!r}")
+    by_name = {acc.name: acc for acc in accounts}
+    live = [c for c in credits if c.left > 0 and c.expires > now]
+    out: list[dict[str, Any]] = []
+    for c in sorted(live, key=lambda x: (x.expires, x.account, x.id)):
+        a = by_name.get(c.account)
+        full = c.kind == "full"
+        used: float | None = None
+        sec: float | None = None
+        reset = sec_reset = None
+        if a is not None:
+            reset, sec_reset = a.reset, a.secondary_reset
+            used = a.used_pct
+            if used is not None and reset is not None and reset <= now:
+                used = 0.0
+            sec = a.secondary_pct
+            if sec is not None and sec_reset is not None and sec_reset <= now:
+                sec = 0.0
+        gain_src = used if full else sec
+        window_reset = reset if full else sec_reset
+        unread = a is None or not a.usable or (full and used is None)
+        gain = 0.0 if unread or gain_src is None else gain_src
+        verdict, reason = _credit_verdict(
+            c, used, sec, window_reset, unread, now, mode, demand, config
+        )
+        out.append(
+            {
+                "account": c.account,
+                "id": c.id,
+                "kind": c.kind,
+                "expires": _iso(c.expires),
+                "verdict": verdict,
+                "reason": reason,
+                "gain_pct": round(gain, 1),
+                "hours_to_expiry": round(_hours(c.expires - now), 1),
+                "hours_to_reset": None if unread else _left_h(window_reset, now),
+            }
+        )
+    return out

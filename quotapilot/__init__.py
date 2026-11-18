@@ -3,6 +3,8 @@
 from .core import (
     Account,
     Config,
+    Credit,
+    advise_credits,
     average_pace,
     decide,
     forecast,
@@ -11,11 +13,13 @@ from .core import (
     project,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Account",
     "Config",
+    "Credit",
+    "advise_credits",
     "average_pace",
     "decide",
     "forecast",
