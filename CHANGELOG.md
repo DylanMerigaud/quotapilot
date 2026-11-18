@@ -4,8 +4,8 @@
 
 - `forecast`: one week ahead at a pace with every window refilling at its reset, in three modes
   (`surplus`, `on_track`, `short`) and the first dry stretch (`dry_at`, `dry_until`, `dry_hours`).
-- `pace_band`: the floor (lowest pace that wastes nothing) and the ceiling (highest pace that
-  never runs the pool dry) in points per hour.
+- `pace_band`: the floor (lowest pace whose lost units stay under `burn_floor_units`) and the
+  ceiling (highest pace whose dry time stays under `short_min_h` hours) in points per hour.
 - `Config.short_min_h`: how many dry hours make a `short` (default 1).
 
 ## 0.1.0

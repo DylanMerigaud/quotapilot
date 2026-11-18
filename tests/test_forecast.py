@@ -119,3 +119,28 @@ def test_first_windows_match_project(pace):
 def test_version_and_exports():
     assert quotapilot.__version__ == "0.2.0"
     assert "forecast" in quotapilot.__all__ and "pace_band" in quotapilot.__all__
+
+
+def test_tiny_pace_does_not_overflow():
+    assert pace_band([Account("a", 100, h(10))], NOW)[0] is not None
+    out = forecast(two(), 1e-12, NOW, CFG)
+    assert out["mode"] == "surplus"
+
+
+def test_rows_sorted_by_first_reset_with_stale_account():
+    out = forecast([Account("A", 80, h(-2)), Account("B", 50, h(10))], 1.0, NOW, CFG)
+    assert [r["name"] for r in out["accounts"]] == ["B", "A"]
+
+
+def test_empty_pool_is_short():
+    out = forecast([], 1.0, NOW, CFG)
+    assert out["mode"] == "short"
+    assert out["dry_at"] == iso(NOW) and out["dry_until"] == iso(h(168))
+    assert out["dry_hours"] == 168
+    assert forecast([], 0.0, NOW, CFG)["mode"] == "on_track"
+    assert pace_band([], NOW, CFG) == (None, None)
+
+
+def test_full_window_is_empty_now():
+    out = forecast([Account("F", 100, h(10))], 1.0, NOW, CFG)
+    assert out["accounts"][0]["empty_at"] == iso(NOW)

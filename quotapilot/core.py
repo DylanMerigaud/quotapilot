@@ -297,21 +297,27 @@ def _forecast_raw(
             while reset <= now:
                 reset += week
             wins.append(_Window(a, 100.0, reset))
+    wins.sort(key=lambda w: w.reset)
+    for w in wins:
+        if w.room <= _EPS:
+            w.empty_at = now
     t = now
     lost = 0.0
     dry_at: datetime | None = None
     dry_until: datetime | None = None
     dry_h = 0.0
+    if not wins and pace > 0:
+        return wins, 0.0, now, end, config.week_hours
     while t < end and wins:
         nxt = min(w.reset for w in wins)
         live = [w for w in wins if w.room > _EPS]
         if live and pace > 0:
             w = min(live, key=lambda x: x.reset)
-            t_empty = t + timedelta(hours=w.room / pace)
-            t2 = min(t_empty, nxt, end)
-            w.room = max(0.0, w.room - pace * _hours(t2 - t))
-            if t2 == t_empty:
-                w.room = 0.0
+            h_next = _hours(min(nxt, end) - t)
+            need = w.room / pace
+            h = min(need, h_next)
+            t2 = t + timedelta(hours=h)
+            w.room = 0.0 if need <= h_next else max(0.0, w.room - pace * h)
             if w.room <= _EPS and w.refills == 0 and w.empty_at is None:
                 w.empty_at = t2
         else:
