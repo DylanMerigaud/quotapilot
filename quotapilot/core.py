@@ -38,6 +38,7 @@ class Config:
     min_span_h: float = 6
     history_h: float = 24
     secondary_hold_h: float = 24
+    short_min_h: float = 1.0
 
 
 DEFAULT = Config()
@@ -262,3 +263,157 @@ def decide(
         "accounts": rows,
         "summary": summary,
     }
+
+
+_EPS = 1e-9
+
+
+class _Window:
+    """One quota window of the forecast: its room, its next reset and the first window's facts."""
+
+    def __init__(self, account: Account, room: float, reset: datetime) -> None:
+        self.account = account
+        self.room = room
+        self.reset = reset
+        self.first_reset = reset
+        self.refills = 0
+        self.lost = 0.0
+        self.empty_at: datetime | None = None
+
+
+def _forecast_raw(
+    accounts: Sequence[Account], pace: float, now: datetime, config: Config
+) -> tuple[list[_Window], float, datetime | None, datetime | None, float]:
+    """Walk one week: (windows, total lost points, dry_at, dry_until, dry hours)."""
+    week = timedelta(hours=config.week_hours)
+    end = now + week
+    wins: list[_Window] = []
+    for a in sorted(_counted(accounts), key=lambda x: x.reset):  # type: ignore[arg-type,return-value]
+        assert a.reset is not None and a.used_pct is not None
+        if a.reset > now:
+            wins.append(_Window(a, max(0.0, 100 - a.used_pct), a.reset))
+        else:
+            reset = a.reset
+            while reset <= now:
+                reset += week
+            wins.append(_Window(a, 100.0, reset))
+    t = now
+    lost = 0.0
+    dry_at: datetime | None = None
+    dry_until: datetime | None = None
+    dry_h = 0.0
+    while t < end and wins:
+        nxt = min(w.reset for w in wins)
+        live = [w for w in wins if w.room > _EPS]
+        if live and pace > 0:
+            w = min(live, key=lambda x: x.reset)
+            t_empty = t + timedelta(hours=w.room / pace)
+            t2 = min(t_empty, nxt, end)
+            w.room = max(0.0, w.room - pace * _hours(t2 - t))
+            if t2 == t_empty:
+                w.room = 0.0
+            if w.room <= _EPS and w.refills == 0 and w.empty_at is None:
+                w.empty_at = t2
+        else:
+            t2 = min(nxt, end)
+            if pace > 0 and t2 > t:
+                dry_h += _hours(t2 - t)
+                if dry_at is None:
+                    dry_at, dry_until = t, t2
+                elif dry_until == t:
+                    dry_until = t2
+        t = t2
+        for w in wins:
+            if w.reset <= t:
+                if w.refills == 0:
+                    w.lost = w.room
+                lost += w.room
+                w.room = 100.0
+                w.reset += week
+                w.refills += 1
+    return wins, lost, dry_at, dry_until, dry_h
+
+
+def _mode(lost_pts: float, dry_h: float, config: Config) -> str:
+    if lost_pts / 100 * config.units_per_week >= config.burn_floor_units:
+        return "surplus"
+    return "short" if dry_h >= config.short_min_h else "on_track"
+
+
+def forecast(
+    accounts: Sequence[Account], pace: float, now: datetime, config: Config = DEFAULT
+) -> dict[str, Any]:
+    """One week ahead at `pace` points per hour, every window refilling at its reset.
+
+    The live window with the soonest reset is drained first. Mode is `surplus` when the lost
+    units reach `burn_floor_units`, else `short` when the pool is dry for `short_min_h` hours or
+    more, else `on_track`. A reading only: nothing is capped or throttled.
+    """
+    wins, lost, dry_at, dry_until, dry_h = _forecast_raw(accounts, pace, now, config)
+    rows: list[dict[str, Any]] = []
+    for w in wins:
+        assert w.account.used_pct is not None
+        used = w.account.used_pct if w.account.reset and w.account.reset > now else 0.0
+        left_h = _hours(w.first_reset - now)
+        week_pct = max(0.0, min(100.0, 100 * (1 - left_h / config.week_hours)))
+        rows.append(
+            {
+                "name": w.account.name,
+                "used_pct": round(used, 1),
+                "week_pct": round(week_pct, 1),
+                "projected_pct": round(100 - w.lost, 1),
+                "lost_pct": round(w.lost, 1),
+                "empty_at": _iso(w.empty_at) if w.empty_at else None,
+                "reset": _iso(w.first_reset),
+            }
+        )
+    return {
+        "mode": _mode(lost, dry_h, config),
+        "lost_units": round(lost / 100 * config.units_per_week, 1),
+        "dry_at": _iso(dry_at) if dry_at else None,
+        "dry_until": _iso(dry_until) if dry_until else None,
+        "dry_hours": round(dry_h, 1),
+        "horizon": _iso(now + timedelta(hours=config.week_hours)),
+        "pace_pct_h": round(pace, 2),
+        "accounts": rows,
+    }
+
+
+def pace_band(
+    accounts: Sequence[Account], now: datetime, config: Config = DEFAULT
+) -> tuple[float | None, float | None]:
+    """(floor, ceiling) in points per hour: the lowest pace that is not `surplus` and the highest
+    pace that is not `short`. (None, None) when no account is counted."""
+    counted = _counted(accounts)
+    if not counted:
+        return None, None
+    top = 100.0 * max(1, len(counted))
+
+    def surplus(p: float) -> bool:
+        _, lost, _, _, dry = _forecast_raw(accounts, p, now, config)
+        return _mode(lost, dry, config) == "surplus"
+
+    def short(p: float) -> bool:
+        return _forecast_raw(accounts, p, now, config)[4] >= config.short_min_h
+
+    floor = 0.0
+    if surplus(0.0):
+        lo, hi = 0.0, top
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            if surplus(mid):
+                lo = mid
+            else:
+                hi = mid
+        floor = hi
+    ceiling = top
+    if short(top):
+        lo, hi = 0.0, top
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            if short(mid):
+                hi = mid
+            else:
+                lo = mid
+        ceiling = lo
+    return round(floor, 2), round(ceiling, 2)

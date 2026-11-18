@@ -46,6 +46,29 @@ quota some providers add, such as a per-model weekly limit. When the account to 
 nothing, the account whose secondary window just reset or dropped is named in `secondary_first`
 and held there for `secondary_hold_h` hours; pass the last result back as `previous=` to carry it.
 
+## Three modes: surplus, on track, short
+
+`forecast(accounts, pace, now)` walks one week ahead at a pace (points per hour) with every
+window refilling at its reset, draining the live window that resets soonest. It returns `mode`:
+`surplus` (the lost units reach `burn_floor_units`), `short` (the pool is dry for at least
+`short_min_h` hours) or `on_track`, plus `lost_units`, the first dry stretch (`dry_at`,
+`dry_until`, `dry_hours`) and one row per account (`projected_pct`, `lost_pct`, `empty_at`).
+`pace_band(accounts, now)` returns `(floor, ceiling)`: the lowest pace that is not a surplus and
+the highest pace that is not short.
+
+```python
+from quotapilot import forecast, pace_band
+
+view = forecast(accounts, 1.0, now)
+print(view["mode"], view["lost_units"], view["dry_at"], view["dry_hours"])
+for row in view["accounts"]:
+    print(row["name"], row["projected_pct"], row["empty_at"])
+floor, ceiling = pace_band(accounts, now)
+print(f"stay between {floor} and {ceiling} points per hour")
+```
+
+It is a reading: it never caps or throttles anything.
+
 ## With claude-swap
 
 quotapilot is an addon above [claude-swap](https://github.com/realiti4/claude-swap), not a

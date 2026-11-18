@@ -5,17 +5,21 @@ from .core import (
     Config,
     average_pace,
     decide,
+    forecast,
+    pace_band,
     pace_from_history,
     project,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Account",
     "Config",
     "average_pace",
     "decide",
+    "forecast",
+    "pace_band",
     "pace_from_history",
     "project",
 ]
