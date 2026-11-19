@@ -1,0 +1,63 @@
+name: Contract
+
+# The published package, as a user installs it from PyPI, against the source it reads: the
+# newest claude-swap release (its `--list --json` serializer and its `cswap` binary), on the
+# oldest supported CPython and the newest stable ones. claude-swap needs Python 3.12 or later, so
+# the live contract runs on 3.13 and 3.14 only.
+# Two suites run from a copy outside the source tree, so the import can only resolve to the
+# installed wheel: the tests of the release tag, and the live contract tests of main.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published:
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Newest versions on PyPI
+        id: pypi
+        run: |
+          v=$(curl -fsSL https://pypi.org/pypi/quotapilot/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "PyPI carries quotapilot $v"
+          git rev-parse --verify "v$v^{commit}"
+      - name: The tests of that release and the live contract tests, outside the source tree
+        run: |
+          mkdir -p /tmp/contract /tmp/live
+          git archive "v${{ steps.pypi.outputs.version }}" tests examples README.md | tar -x -C /tmp/contract
+          rm -rf /tmp/contract/tests/contract
+          cp -r tests/contract /tmp/live/
+      - name: Install the published wheel in a fresh environment
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/python -m pip install --no-cache-dir "quotapilot==${{ steps.pypi.outputs.version }}" "pytest>=7"
+          /tmp/fresh/bin/python -c "import quotapilot, sys; print(quotapilot.__file__, quotapilot.__version__, sys.version); sys.exit(quotapilot.__version__ != '${{ steps.pypi.outputs.version }}')"
+      - name: Release tests
+        working-directory: /tmp/contract
+        run: /tmp/fresh/bin/python -m pytest -q -p no:cacheprovider
+      - name: Install the newest claude-swap
+        if: matrix.python-version != '3.9'
+        run: |
+          v=$(curl -fsSL https://pypi.org/pypi/claude-swap/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
+          /tmp/fresh/bin/python -m pip install --no-cache-dir "claude-swap==$v"
+      - name: Live contract against claude-swap
+        if: matrix.python-version != '3.9'
+        working-directory: /tmp/live
+        env:
+          QUOTAPILOT_CONTRACT: "1"
+        run: PATH="/tmp/fresh/bin:$PATH" /tmp/fresh/bin/python -m pytest -q -p no:cacheprovider contract
