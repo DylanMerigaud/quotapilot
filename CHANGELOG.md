@@ -3,7 +3,8 @@
 ## 0.4.0
 
 - `plan_credits`: plan when to spend each on-demand reset credit by forward simulation of the
-  pool (decision `now`, `planned`, `keep`, `let_expire`, `fallback` or `unknown`, `planned_at`,
+  pool (decision `now`, `planned`, `keep`, `let_expire` (only within `credit_expiry_margin_h` of
+  expiry), `fallback` or `unknown`, `planned_at`,
   `value_pct`, `now_value_pct`, a reason), plus a week forecast with and without the planned
   credits. A full reset keeps the natural reset date (measured on Claude accounts in November
   2026); `credit_semantics="restart_window"` exists for providers that restart the window.

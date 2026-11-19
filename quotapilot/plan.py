@@ -46,6 +46,8 @@ def pace_profile(
     `profile_min_days` days or when nothing was consumed.
     """
     _aware(now, "now")
+    for smp in samples:
+        _aware(smp[0], "sample time")
     kept = [
         (s[0], s[1], s[2])
         for s in samples
@@ -64,9 +66,9 @@ def pace_profile(
     sums = [0.0] * 24
     for rows in by_name.values():
         rows.sort(key=lambda r: r[0])
-        for (_, a), (at_b, b) in zip(rows, rows[1:]):
+        for (at_a, a), (at_b, b) in zip(rows, rows[1:]):
             if b - a > 0:
-                sums[at_b.astimezone(timezone.utc).hour] += b - a
+                _spread(sums, at_a, at_b, b - a)
     if sum(sums) <= 0:
         return None
     counts = [0] * 24
@@ -79,8 +81,30 @@ def pace_profile(
     fill = sum(known) / len(known)
     rate = [sums[h] / counts[h] if counts[h] > 0 else fill for h in range(24)]
     prof = _renorm(rate)
-    prof = [max(v, config.profile_floor) for v in prof]
-    return _renorm(prof)
+    floor = config.profile_floor
+    for _ in range(24):
+        low = [v < floor for v in prof]
+        if not any(low):
+            break
+        # pin the low hours at the floor and rescale the others so the mean stays 1.0
+        rest = sum(v for v, lo in zip(prof, low) if not lo)
+        scale = (len(prof) - floor * sum(low)) / rest if rest > 0 else 1.0
+        prof = [floor if lo else v * scale for v, lo in zip(prof, low)]
+    return prof
+
+
+def _spread(sums: list[float], a: datetime, b: datetime, delta: float) -> None:
+    """Add `delta` to the UTC hours between a and b, proportional to the time in each hour."""
+    a, b = a.astimezone(timezone.utc), b.astimezone(timezone.utc)
+    total = (b - a).total_seconds()
+    if total <= 0:
+        sums[b.hour] += delta
+        return
+    cur = a
+    while cur < b:
+        nxt = min(b, cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+        sums[cur.hour] += delta * (nxt - cur).total_seconds() / total
+        cur = nxt
 
 
 def _renorm(values: list[float]) -> list[float]:
@@ -290,6 +314,13 @@ def _choose(
     for t in base.hits.get(c.account, []):
         if t < limit - _EPS:
             add(t, "ceiling")
+    add(0.0, "now")
+    for _, at, _k in planned:
+        t = _hours(at - now)
+        if 0 <= t < limit - _EPS:
+            add(t, "after_spend")
+    for t in _reset_moments(track, limit):
+        add(t, "after_reset")
     if limit > _EPS:
         add(limit, "last")
     cache: dict[float, float] = {}
@@ -304,28 +335,53 @@ def _choose(
     now_value = value(0.0)
     vals = {t: value(t) for t in cands}
     best = max(vals.values()) if vals else 0.0
-    inside = _hours(c.expires - now) <= cfg.plan_horizon_h
+    soon = _hours(c.expires - now) <= cfg.credit_expiry_margin_h
     if best < cfg.plan_min_value_pct:
-        reason = zero_pace_reason or ("nothing_to_recover" if inside else "no_gain_in_horizon")
+        if soon:
+            reason = zero_pace_reason or "nothing_to_recover"
+        else:
+            reason = zero_pace_reason or "no_gain_at_pace"
         return {
-            "decision": "let_expire" if inside else "keep",
+            "decision": "let_expire" if soon else "keep",
             "reason": reason,
             "at": None,
             "value": 0.0,
             "now_value": now_value,
         }
-    ties = [t for t, v in vals.items() if v >= best - cfg.plan_tie_pct]
+    ties = [t for t, v in vals.items() if v >= max(best - cfg.plan_tie_pct, cfg.plan_min_value_pct)]
     pick = min(ties, key=lambda t: (cands[t] != "dry", t))
     tag = cands[pick]
-    reason = {"dry": "pool_dry", "ceiling": "ceiling_runway", "last": "before_expiry"}[tag]
+    reason = {
+        "dry": "pool_dry",
+        "ceiling": "ceiling_runway",
+        "now": "best_now",
+        "after_spend": "after_planned_spend",
+        "after_reset": "after_natural_reset",
+        "last": "before_expiry",
+    }[tag]
     decision = "now" if pick <= cfg.plan_now_tol_h else "planned"
     return {
         "decision": decision,
         "reason": reason,
         "at": now + timedelta(hours=pick),
-        "value": vals[pick],
+        "value": now_value if decision == "now" else vals[pick],
         "now_value": now_value,
     }
+
+
+def _reset_moments(track: _Track, limit: float) -> list[float]:
+    """The step-grid moments at or after each natural reset of any window, before `limit`."""
+    cfg = track.config
+    step, week = cfg.plan_step_h, float(cfg.week_hours)
+    out: list[float] = []
+    for _, _, reset in track.windows:
+        r = _hours(reset - track.now)
+        while r <= 0:
+            r += week
+        while r < limit - _EPS:
+            out.append(math.ceil(r / step - 1e-9) * step)
+            r += week
+    return out
 
 
 def _next_reset_h(reset: datetime, at: datetime, config: Config) -> float:
@@ -363,6 +419,12 @@ def plan_credits(
         _aware(c.expires, f"credit {c.id} expires")
         if c.kind not in ("full", "secondary"):
             raise ValueError(f"unknown credit kind: {c.kind!r}")
+    if pace is None or pace < 0:
+        raise ValueError("pace must be a number of points per hour, zero or more")
+    if secondary_pace is not None and secondary_pace < 0:
+        raise ValueError("secondary_pace must be zero or more")
+    if profile is not None and len(profile) != 24:
+        raise ValueError("profile must hold 24 hourly factors")
     if config.credit_semantics not in ("keep_date", "restart_window"):
         raise ValueError(f"unknown credit_semantics: {config.credit_semantics!r}")
     by_name = {a.name: a for a in accounts}
@@ -472,7 +534,9 @@ def _week(
     covered_by = [
         r["id"]
         for r in rows
-        if r["planned_at"] is not None and datetime.fromisoformat(r["planned_at"]) < end
+        if r["kind"] == "full"
+        and r["planned_at"] is not None
+        and datetime.fromisoformat(r["planned_at"]) < end
     ]
     dry_at = dry_until = None
     if withc.dry:

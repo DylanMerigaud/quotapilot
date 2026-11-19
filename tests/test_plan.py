@@ -129,9 +129,9 @@ def _history(days, hour_of_day=16):
     for d in range(days):
         for hh in range(24):
             at = start + timedelta(days=d, hours=hh)
+            out.append((at, "A", used))
             if hh == hour_of_day:
                 used += 5
-            out.append((at, "A", used))
     return out
 
 
@@ -185,7 +185,7 @@ def test_unknown_not_usable_and_dead_credits():
 
 def test_long_expiry_no_gain_is_keep():
     r = first(plan([Account("A", 0, h(100))], [full(2000)], 0.1))
-    assert (r["decision"], r["reason"]) == ("keep", "no_gain_in_horizon")
+    assert (r["decision"], r["reason"]) == ("keep", "no_gain_at_pace")
 
 
 @pytest.mark.parametrize("seed", range(40))
@@ -216,3 +216,103 @@ def test_property_full_credit(seed):
     if best >= cfg.plan_min_value_pct + 1.0:
         assert row["decision"] in ("now", "planned")
         assert row["value_pct"] >= best - 1.0
+
+
+def test_r1_tie_set_never_below_the_minimum():
+    r = first(plan([Account("A", 100, h(1.0))], [Credit("A", "c", "full", h(3.75))], 0.6))
+    assert r["decision"] == "planned" and r["value_pct"] >= 1.0
+    assert off(r) == pytest.approx(2.75, abs=0.25)
+
+
+def test_r2_candidates_include_other_planned_spends():
+    accounts = [Account("A", 100, h(120)), Account("B", 76, h(160)), Account("C", 100, h(18))]
+    credits = [Credit("B", "b", "full", h(58)), Credit("A", "a", "full", h(310))]
+    out = plan(accounts, credits, 2)["credits"]
+    assert out[0]["id"] == "b" and off(out[0]) == pytest.approx(11.5, abs=0.25)
+    assert off(out[1]) == pytest.approx(11.5, abs=0.5) and out[1]["value_pct"] > 90
+
+
+def test_r3_now_is_always_a_candidate():
+    accounts = [Account("A", 90, h(150)), Account("B", 10, h(127)), Account("C", 100, h(30))]
+    cfg = Config(credit_semantics="restart_window")
+    r = first(plan(accounts, [Credit("A", "c", "full", h(390))], 2.7, config=cfg))
+    assert r["decision"] == "now" and r["value_pct"] == pytest.approx(r["now_value_pct"], abs=0.1)
+    assert r["value_pct"] > 70
+
+
+def test_r4_let_expire_only_near_expiry():
+    acc = [Account("A", 0, h(100))]
+    near = first(plan(acc, [full(20)], 0.1))
+    far = first(plan(acc, [full(300)], 0.1))
+    assert (near["decision"], near["reason"]) == ("let_expire", "nothing_to_recover")
+    assert (far["decision"], far["reason"]) == ("keep", "no_gain_at_pace")
+    sacc = [Account("A", 10, h(100), 100, h(100))]
+    s = first(plan(sacc, [Credit("A", "s", "secondary", h(300))], 1, secondary_pace=0))
+    assert (s["decision"], s["reason"]) == ("keep", "no_secondary_work")
+    s = first(plan(sacc, [Credit("A", "s", "secondary", h(20))], 1, secondary_pace=0))
+    assert (s["decision"], s["reason"]) == ("let_expire", "no_secondary_work")
+
+
+def test_r5_validation():
+    a = [Account("A", 100, h(10))]
+    with pytest.raises(ValueError):
+        pace_profile([(datetime(2026, 11, 18), "A", 1.0)], NOW)
+    for bad in (None, -1.0):
+        with pytest.raises(ValueError):
+            plan_credits(a, [], bad, NOW)
+    with pytest.raises(ValueError):
+        plan_credits(a, [], 1.0, NOW, profile=[1.0] * 23)
+
+
+def test_r5_floor_holds_after_renormalisation():
+    cfg = Config(profile_floor=0.3)
+    p = pace_profile(_history(5), NOW, cfg)
+    assert min(p) >= 0.3 - 1e-9 and sum(p) / 24 == pytest.approx(1.0, abs=1e-9)
+
+
+def test_r5_increment_spread_over_the_interval():
+    # one +6 jump between 02:30 and 04:30 touches hours 2, 3 and 4 (30, 60, 30 minutes)
+    base = NOW - timedelta(days=4)
+    s = [(base, "A", 0.0), (base + timedelta(hours=2, minutes=30), "A", 0.0)]
+    s += [(base + timedelta(hours=4, minutes=30), "A", 6.0), (NOW, "A", 6.0)]
+    p = pace_profile(s, NOW)
+    assert p[3] == pytest.approx(2 * p[2]) and p[2] == pytest.approx(p[4])
+
+
+def test_r5_covered_by_lists_full_credits_only():
+    acc = [Account("A", 100, h(100), 100, h(100))]
+    cs = [Credit("A", "f", "full", h(300)), Credit("A", "s", "secondary", h(310))]
+    out = plan(acc, cs, 1.5, secondary_pace=1.0)
+    assert out["forecast"]["covered_by"] == ["f"]
+
+
+def test_r6_second_credit_matches_grid_max():
+    cfg = Config(plan_step_h=0.5)
+    checked = 0
+    for seed in range(40):
+        rng = random.Random(1000 + seed)
+        accounts = [Account(n, rng.uniform(0, 100), h(rng.uniform(1, 167))) for n in ("A", "B")]
+        pace = rng.uniform(0.3, 4)
+        e1, e2 = sorted(rng.uniform(10, 400) for _ in range(2))
+        c1, c2 = Credit("A", "c1", "full", h(e1)), Credit("B", "c2", "full", h(e2))
+        rows = plan_credits(accounts, [c1, c2], pace, NOW, config=cfg)["credits"]
+        planned = []
+        if rows[0]["planned_at"]:
+            planned = [("A", datetime.fromisoformat(rows[0]["planned_at"]), "full")]
+        track = _Track(
+            [w for w in (_window(a, False) for a in accounts) if w], pace, None, NOW, cfg
+        )
+        end = min(h(cfg.plan_horizon_h), c2.expires + timedelta(hours=cfg.week_hours))
+        times = [t * 6.0 for t in range(int((e2 - 1) // 6) + 1)]
+        if planned:
+            times.append(_hours_of(planned[0][1]))
+        best = max(_full_value(track, c2, h(t), planned, end) for t in times if t <= e2 - 1.0)
+        if best >= cfg.plan_min_value_pct + 1.0:
+            checked += 1
+            assert rows[1]["decision"] in ("now", "planned")
+            assert rows[1]["value_pct"] >= best - 1.0
+    assert checked > 5
+
+
+def _hours_of(dt):
+    return (dt - NOW).total_seconds() / 3600

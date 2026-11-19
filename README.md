@@ -103,13 +103,15 @@ print(row["verdict"], row["reason"], row["gain_pct"])  # now spent_far_reset 100
 `advise_credits` looks at one moment. `plan_credits(accounts, credits, pace, now, profile=None,
 secondary_pace=None)` looks ahead: it simulates the pool step by step (`plan_step_h`, 15 minutes)
 over up to `plan_horizon_h` (28 days), demand drained from the window with the soonest reset, and
-says for each live credit when to spend it: `now`, `planned` (with `planned_at`), `keep`,
-`let_expire`, `fallback` (a secondary credit without a secondary pace: use `advise_credits`) or
+says for each live credit when to spend it: `now`, `planned` (with `planned_at`), `keep`
+(nothing worth recovering at this pace, so far from expiry it is kept and re-planned later),
+`let_expire` (the same, but the credit expires within `credit_expiry_margin_h`, 24 hours), `fallback` (a secondary credit without a secondary pace: use `advise_credits`) or
 `unknown`, with a reason.
 
 The value of a spend at time s is the extra points the pool serves over the horizon with the
-credit spent at s than without it. Candidates are the moments that can matter: the pool going dry,
-the account hitting its ceiling, and the last chance before expiry. A plan under
+credit spent at s than without it. Candidates are the moments that can matter: now, the pool going dry,
+the account hitting its ceiling, each natural reset, each spend already planned, and the last
+chance before expiry. A plan under
 `plan_min_value_pct` (1 point) is never made; candidates within `plan_tie_pct` of the best are
 ties, settled for a dry moment first, then the earliest. Credits are planned in order of expiry
 and each plan counts the spends planned before it. The result also carries a week `forecast` with
