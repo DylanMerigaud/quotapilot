@@ -12,8 +12,9 @@ from .core import (
     pace_from_history,
     project,
 )
+from .plan import pace_profile, plan_credits
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Account",
@@ -25,5 +26,7 @@ __all__ = [
     "forecast",
     "pace_band",
     "pace_from_history",
+    "pace_profile",
+    "plan_credits",
     "project",
 ]

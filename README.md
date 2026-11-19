@@ -98,6 +98,41 @@ row = advise_credits(accounts, credits, now, mode="on_track")[0]
 print(row["verdict"], row["reason"], row["gain_pct"])  # now spent_far_reset 100.0
 ```
 
+## Planning on-demand resets (0.4.0)
+
+`advise_credits` looks at one moment. `plan_credits(accounts, credits, pace, now, profile=None,
+secondary_pace=None)` looks ahead: it simulates the pool step by step (`plan_step_h`, 15 minutes)
+over up to `plan_horizon_h` (28 days), demand drained from the window with the soonest reset, and
+says for each live credit when to spend it: `now`, `planned` (with `planned_at`), `keep`,
+`let_expire`, `fallback` (a secondary credit without a secondary pace: use `advise_credits`) or
+`unknown`, with a reason.
+
+The value of a spend at time s is the extra points the pool serves over the horizon with the
+credit spent at s than without it. Candidates are the moments that can matter: the pool going dry,
+the account hitting its ceiling, and the last chance before expiry. A plan under
+`plan_min_value_pct` (1 point) is never made; candidates within `plan_tie_pct` of the best are
+ties, settled for a dry moment first, then the earliest. Credits are planned in order of expiry
+and each plan counts the spends planned before it. The result also carries a week `forecast` with
+and without the planned credits (`covered_hours`, `covered_by`).
+
+A full reset keeps the natural reset date of the account (measured on Claude accounts in
+November 2026): spending it too early only gives back what the natural reset would have given.
+`Config(credit_semantics="restart_window")` exists for providers that restart the window
+(reset moved to the spend time plus a week). `pace_profile(history, now)` turns a few days of
+samples into 24 hourly factors (mean 1.0) to pass as `profile`, so demand follows the day.
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from quotapilot import Account, Credit, plan_credits
+
+now = datetime(2026, 11, 19, tzinfo=timezone.utc)
+accounts = [Account("4", 100, now + timedelta(hours=96))]
+credits = [Credit("4", "full-reset-2611", "full", now + timedelta(days=12))]
+row = plan_credits(accounts, credits, 1.5, now)["credits"][0]
+print(row["decision"], row["reason"], row["value_pct"])  # now pool_dry 99.0
+```
+
 ## With claude-swap
 
 quotapilot is an addon above [claude-swap](https://github.com/realiti4/claude-swap), not a

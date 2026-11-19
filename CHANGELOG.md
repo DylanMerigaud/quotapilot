@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- `plan_credits`: plan when to spend each on-demand reset credit by forward simulation of the
+  pool (decision `now`, `planned`, `keep`, `let_expire`, `fallback` or `unknown`, `planned_at`,
+  `value_pct`, `now_value_pct`, a reason), plus a week forecast with and without the planned
+  credits. A full reset keeps the natural reset date (measured on Claude accounts in November
+  2026); `credit_semantics="restart_window"` exists for providers that restart the window.
+- `pace_profile`: 24 hourly demand factors (mean 1.0) from the last 7 days of samples.
+- `Config`: `plan_step_h` (0.25), `plan_horizon_h` (672), `plan_min_value_pct` (1.0),
+  `plan_tie_pct` (0.5), `plan_now_tol_h` (0.25), `plan_expiry_guard_h` (1.0), `profile_min_days`
+  (3.0), `profile_floor` (0.05), `credit_semantics` ("keep_date").
+
 ## 0.3.0
 
 - `advise_credits`: for each on-demand reset `Credit` (a provider-granted reset of an account's

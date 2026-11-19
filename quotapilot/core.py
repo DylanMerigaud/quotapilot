@@ -57,6 +57,15 @@ class Config:
     credit_expiry_margin_h: float = 24
     credit_min_lead_h: float = 24
     spent_pct: float = 99.0
+    plan_step_h: float = 0.25
+    plan_horizon_h: float = 672  # 28 days
+    plan_min_value_pct: float = 1.0  # a spend recovering less is never planned
+    plan_tie_pct: float = 0.5  # candidates within this of the best are ties
+    plan_now_tol_h: float = 0.25  # planned within this of now means "now"
+    plan_expiry_guard_h: float = 1.0  # the last chance candidate is expiry minus this
+    profile_min_days: float = 3.0
+    profile_floor: float = 0.05
+    credit_semantics: str = "keep_date"  # or "restart_window"
 
 
 DEFAULT = Config()
