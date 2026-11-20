@@ -123,7 +123,7 @@ def test_expired_room_two_resets():
         (h(-100), "A", 40.0),
         (h(-90), "A", 2.0),
     ]
-    assert expired_room(s, NOW) == {"A": round((99 - 80) + (99 - 40), 1)}
+    assert expired_room(s, NOW) == {"A": float((99 - 80) + (99 - 40))}
 
 
 def test_expired_room_no_reset_and_full_reset():

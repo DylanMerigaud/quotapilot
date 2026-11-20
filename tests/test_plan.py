@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from quotapilot import Account, Config, Credit, pace_profile, plan_credits
-from quotapilot.plan import _Track, _window
+from quotapilot.plan import _pick, _Track, _window
 
 UTC = timezone.utc
 NOW = datetime(2026, 11, 19, 0, 0, tzinfo=UTC)
@@ -203,7 +203,7 @@ def _eligible_best(track, c, planned, end, times, cfg):
         base = track.sim(end, planned)
         sim = track.sim(end, [*planned, spend])
         v = sim.consumed - base.consumed
-        clears = sim.cleared.get((c.account, round(t, 6)), 0.0)
+        clears = sim.cleared.get(len(planned), 0.0)
         share = v / clears if clears > 0 else 0.0
         if v >= cfg.plan_min_value_pct and (soon or share >= cfg.credit_min_value_share):
             best = max(best, v)
@@ -425,10 +425,13 @@ def test_inside_the_margin_nothing_to_recover_is_let_expire():
 
 def test_inside_the_margin_a_better_later_moment_is_planned():
     # 44 h to expiry (inside 48): now is worth little, the ceiling at ~20 h is worth more
+    # A has 94 points of room: at pace 5 it hits its ceiling at 18.75 h and the pool is dry
+    # (B is full) until A's reset; now is worth 5 points, the dry start 98.8
     accounts = [acc("A", 5, 100), acc("B", 99, 120)]
     r = first(plan(accounts, [full(44)], 5))
-    assert r["decision"] in ("now", "planned")
-    assert r["value_pct"] >= 10
+    assert (r["decision"], r["reason"]) == ("planned", "pool_dry")
+    assert off(r) == pytest.approx(18.75, abs=0.01)
+    assert r["now_value_pct"] == 5.0 and r["value_pct"] == pytest.approx(98.8, abs=0.1)
 
 
 def test_ties_go_toward_later_the_s6_picture():
@@ -460,7 +463,7 @@ def test_pool_surplus_by_the_baseline_week_when_no_mode_is_passed():
 def test_pool_surplus_does_not_apply_inside_the_margin():
     accounts = [acc("A", 99, 159), acc("B", 0, 10)]
     r = first(plan(accounts, [full(30)], 1, mode="surplus"))
-    assert r["reason"] != "pool_surplus"
+    assert (r["decision"], r["reason"]) == ("now", "before_expiry")
 
 
 def sec(exp=2000, **kw):
@@ -488,13 +491,13 @@ def test_secondary_switch_instead_when_another_account_has_both_rooms():
 def test_secondary_no_switch_when_the_other_account_has_no_weekly_room():
     accounts = [acc("A", 39, 100, 99, 100), acc("B", 99, 120, 20, 120)]
     r = first(plan(accounts, [sec()], 1, secondary_pace=2))
-    assert r["reason"] != "switch_instead"
+    assert (r["decision"], r["reason"]) == ("now", "secondary_spent_weekly_room")
 
 
 def test_secondary_switch_ignores_an_account_without_a_secondary_window():
     accounts = [acc("A", 10, 100, 99, 100), acc("B", 10, 120)]
     r = first(plan(accounts, [sec()], 1, secondary_pace=2))
-    assert r["reason"] != "switch_instead"
+    assert (r["decision"], r["reason"]) == ("now", "secondary_spent_weekly_room")
 
 
 def test_secondary_weekly_spent():
@@ -522,3 +525,66 @@ def test_now_since_is_carried_while_the_verdict_holds_and_reset_when_it_changes(
     assert r3["now_since"] == NOW.isoformat()
     r4 = first(plan([acc("A", 0, 100)], [Credit("A", "c", "full", h(300))], 0.1, previous=prev))
     assert r4["now_since"] is None
+
+
+def test_not_spent_is_not_said_once_the_secondary_reset_has_passed():
+    # the window reads 50 but its reset is behind us: it is refilled, the credit is judged on value
+    accounts = [acc("A", 39, 100, 50, -5)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=2))
+    assert (r["decision"], r["reason"]) == ("planned", "pool_dry")
+
+
+def test_pick_every_tie_after_the_dry_start_gives_the_earliest():
+    vals = {10.0: 50.0, 20.0: 50.0, 30.0: 50.0}
+    assert _pick([10.0, 20.0, 30.0], vals, 5.0, CFG) == 10.0
+
+
+def test_pick_ties_up_to_the_dry_start_give_the_latest_of_them():
+    vals = {10.0: 50.0, 20.0: 50.0, 30.0: 50.0}
+    assert _pick([10.0, 20.0, 30.0], vals, 25.0, CFG) == 20.0
+
+
+def test_pick_with_no_dry_stretch_gives_the_latest_tie():
+    # a full credit with value but no dry stretch cannot be built (value needs unmet demand), so
+    # the rule is pinned on the pick itself
+    vals = {10.0: 50.0, 20.0: 49.8, 30.0: 10.0}
+    assert _pick([10.0, 20.0, 30.0], vals, None, CFG) == 20.0
+
+
+def test_pick_dry_start_now_wins_with_a_tied_moment_now():
+    vals = {0.0: 50.0, 20.0: 50.0}
+    assert _pick([0.0, 20.0], vals, 0.0, CFG) == 0.0
+
+
+def test_now_since_ignores_a_naive_a_non_string_and_normalises_an_offset():
+    accounts = [acc("A", 99, 60), acc("B", 99, 80)]
+    cred = [Credit("B", "c", "full", h(300))]
+
+    def since(value):
+        prev = [{"account": "B", "id": "c", "decision": "now", "now_since": value}]
+        return first(plan(accounts, cred, 3, previous=prev))["now_since"]
+
+    assert since("2026-11-18T23:00:00") == NOW.isoformat()
+    assert since(12) == NOW.isoformat()
+    assert since("not a date") == NOW.isoformat()
+    assert since("2026-11-19T00:30:00+00:00") == NOW.isoformat()  # in the future
+    assert since("2026-11-19T00:30:00+01:00") == "2026-11-18T23:30:00+00:00"
+
+
+def test_each_spend_keeps_its_own_clears_even_at_the_same_moment():
+    from quotapilot.plan import _simulate
+
+    wins = [("A", 99.0, h(60)), ("B", 99.0, h(80))]
+    spends = [("A", h(0), "full"), ("A", h(0), "full")]
+    out = _simulate(wins, 3, NOW, h(100), spends, None, CFG)
+    assert out.cleared == {0: 99.0, 1: 0.0}
+
+
+def test_a_now_within_the_tolerance_reports_the_values_of_its_own_pick():
+    # B refills at 0.25 h: spending at 0.25 or now is a tie, the pick is 0.25 (now by tolerance)
+    accounts = [acc("A", 99, 60), acc("B", 0, 0.25), acc("C", 90, 60)]
+    r = first(plan(accounts, [full(60)], 3, mode="short"))
+    assert r["decision"] == "now" and off(r) == pytest.approx(0.25)
+    assert r["value_pct"] == pytest.approx(99, abs=0.5) and r["clears_pct"] == pytest.approx(99)
+    assert r["share"] == pytest.approx(r["value_pct"] / r["clears_pct"], abs=0.01)
+    assert r["now_value_pct"] is not None

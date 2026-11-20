@@ -52,6 +52,30 @@ def _load_opt(text: Any, what: str) -> datetime | None:
     return None if text is None else _load_at(text, what)
 
 
+def _num(value: Any, what: str) -> float | None:
+    """A percent: None or a real number (a bool or a string is a ValueError)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{what} must be a number: {value!r}")
+    return float(value)
+
+
+def credit_from_json(c: Mapping[str, Any]) -> Credit:
+    """One credit from its snapshot shape. ValueError on a bad shape or naive datetime."""
+    try:
+        return Credit(
+            account=str(c["account"]),
+            id=str(c["id"]),
+            kind=str(c["kind"]),
+            expires=_load_at(c["expires"], f"expires of credit {c['id']}"),
+            left=int(c.get("left", 1)),
+            usable=bool(c.get("usable", True)),
+        )
+    except (KeyError, TypeError, AttributeError) as e:
+        raise ValueError(f"bad credit: {type(e).__name__}: {e}") from e
+
+
 def to_json(snapshot: Snapshot) -> dict[str, Any]:
     """The snapshot as a JSON-ready dict (`schema` 1), every datetime an ISO string."""
     accounts = []
@@ -100,9 +124,9 @@ def from_json(obj: Mapping[str, Any]) -> Snapshot:
             accounts.append(
                 Account(
                     name=name,
-                    used_pct=r["used_pct"],
+                    used_pct=_num(r["used_pct"], f"used_pct of {name}"),
                     reset=_load_opt(r["reset"], f"reset of {name}"),
-                    secondary_pct=r.get("secondary_pct"),
+                    secondary_pct=_num(r.get("secondary_pct"), f"secondary_pct of {name}"),
                     secondary_reset=_load_opt(
                         r.get("secondary_reset"), f"secondary_reset of {name}"
                     ),
@@ -115,17 +139,7 @@ def from_json(obj: Mapping[str, Any]) -> Snapshot:
             (_load_at(s[0], "sample at"), str(s[1]), None if s[2] is None else float(s[2]))
             for s in obj.get("samples", [])
         ]
-        credits = [
-            Credit(
-                account=str(c["account"]),
-                id=str(c["id"]),
-                kind=str(c["kind"]),
-                expires=_load_at(c["expires"], f"expires of credit {c['id']}"),
-                left=int(c.get("left", 1)),
-                usable=bool(c.get("usable", True)),
-            )
-            for c in obj.get("credits", [])
-        ]
+        credits = [credit_from_json(c) for c in obj.get("credits", [])]
         return Snapshot(
             at=_load_at(obj["at"], "at"),
             source=str(obj["source"]),
@@ -156,7 +170,8 @@ def merge(snapshots: Sequence[Snapshot], now: datetime, config: Config = DEFAULT
     A reading's time is its `fetched_at`, or its snapshot's `at` when None. A stale reading older
     than `config.last_good_max_min` minutes from `now` turns unusable (its percent is kept for
     display). With no usable reading for an account, the latest unusable one is kept. Samples are
-    the union on `(at, name)` (the later snapshot wins), sorted; credits are keyed by
+    the union on `(at, name)` (on a clash the one from the later snapshot in the input order is
+    kept), sorted; credits are keyed by
     `(account, id)` and the latest snapshot's wins. ValueError on empty input.
     """
     if not snapshots:

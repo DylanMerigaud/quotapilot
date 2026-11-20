@@ -9,7 +9,8 @@
   Outside the expiry margin a pool in surplus keeps the credit (`pool_surplus`); a value under the
   minimum or the share is `keep low_share`; a pool that is never dry is `keep pool_fine`; a dry
   stretch the credit cannot help is `keep no_gain_at_pace`. Inside the margin the share is waived:
-  a spend worth the minimum is `now before_expiry`, else `let_expire`. Ties between moments go
+  a spend worth the minimum now is `now before_expiry`, else the best later moment worth the
+  minimum is planned, else `let_expire`. Ties between moments go
   toward the later one (the option stays open), unless the pool is dry now.
 - A secondary (for example Fable) credit is kept with `not_spent`, `no_secondary_work`,
   `switch_instead` (another account has secondary and weekly room: switch, do not reset) or
@@ -28,7 +29,8 @@
 - `Account.fetched_at` and `Account.stale`; `Config.last_good_max_min` (60).
 - claude-swap adapter: a failed row carrying `lastGoodUsage` and `lastGoodFetchedAt` is read stale
   while that reading is at most `last_good_max_min` old; `parse_list` and `read` take a `config`.
-- Command line: `python -m quotapilot snapshot` and `python -m quotapilot read --source ...`
+- Command line: `python -m quotapilot snapshot` (with `--credits FILE`, and `--samples` cut to the
+  last 7 days) and `python -m quotapilot read --source ...`
   (a snapshot file, or a shell command printing one), which prints the merged snapshot and a
   forecast as JSON.
 

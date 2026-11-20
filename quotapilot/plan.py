@@ -123,8 +123,8 @@ class _Sim:
         self.ceiling: dict[str, list[bool]] = {}
         self.lost = 0.0  # natural loss, resets inside the first week
         self.first_loss: dict[str, float] = {}
-        # points a spend gave back, by (account, hours after now of the spend)
-        self.cleared: dict[tuple[str, float], float] = {}
+        # points each spend gave back, by the spend's index in the `spends` given
+        self.cleared: dict[int, float] = {}
 
 
 def _simulate(
@@ -164,7 +164,7 @@ def _simulate(
         out.ceiling[name] = []
         out.first_loss.setdefault(name, 0.0)
     firsts = {w[0] for w in ws}
-    pend = sorted((_hours(at - now), name, kind) for name, at, kind in spends)
+    pend = sorted((_hours(at - now), name, kind, i) for i, (name, at, kind) in enumerate(spends))
     pi = 0
     base = now.astimezone(timezone.utc)
     base_h = base.hour + base.minute / 60 + base.second / 3600
@@ -186,12 +186,12 @@ def _simulate(
                 w[2] += week
                 changed = True
         while pi < len(pend) and pend[pi][0] <= t + _EPS:
-            at_h, name, _kind = pend[pi]
+            _, name, _kind, idx = pend[pi]
             pi += 1
             for w in ws:
                 if w[0] == name:
                     w[3] = max(0.0, cap - w[1])
-                    out.cleared.setdefault((name, round(at_h, 6)), w[3])
+                    out.cleared[idx] = w[3]
                     w[1] = cap
                     if config.credit_semantics == "restart_window":
                         w[2] = t + week
@@ -366,10 +366,10 @@ def _choose(
         if key not in cache:
             spend = (c.account, now + timedelta(hours=key), kind)
             sim = track.sim(end, [*list(planned), spend], blocked)
-            cache[key] = (sim.consumed - base.consumed, sim.cleared.get((c.account, key), 0.0))
+            cache[key] = (sim.consumed - base.consumed, sim.cleared.get(len(planned), 0.0))
         return cache[key]
 
-    now_value, now_clears = value(0.0)
+    now_value = value(0.0)[0]
     vals = {t: value(t)[0] for t in cands}
     minimum = cfg.plan_min_value_pct
     dry_start = base.dry[0][0] if base.dry else None
@@ -411,7 +411,7 @@ def _choose(
             return result("keep", "pool_fine" if not base.dry else "no_gain_at_pace", None)
     pick = _pick(eligible, vals, dry_start, cfg)
     if pick <= cfg.plan_now_tol_h:
-        return result("now", _REASONS[cands[pick]], pick, 0.0)
+        return result("now", _REASONS[cands[pick]], pick)
     return result("planned", _REASONS[cands[pick]], pick)
 
 
@@ -623,12 +623,14 @@ def _now_since(
         if (p.get("account"), p.get("id")) != (row["account"], row["id"]):
             continue
         since = p.get("now_since")
-        if p.get("decision") == "now" and since:
-            try:
-                if datetime.fromisoformat(since) <= now:
-                    return str(since)
-            except ValueError:
-                pass
+        if p.get("decision") != "now" or not isinstance(since, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None and parsed <= now:
+                return _iso(parsed)
+        except (TypeError, ValueError):
+            pass
     return _iso(now)
 
 

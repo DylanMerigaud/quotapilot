@@ -143,8 +143,11 @@ points it gives back to the pool are at least `plan_min_value_pct` (10) and at l
 2 is `keep low_share`. A pool that is never dry has nothing to recover (`keep pool_fine`), and a
 pool that is already losing room at its natural resets is in surplus (`keep pool_surplus`). Within
 `credit_expiry_margin_h` (48 hours) of its expiry the share no longer matters: a spend worth the
-minimum is `now before_expiry`, anything less is `let_expire`. When several moments are about as
-good, the later one wins, so the option stays open, unless the pool is dry now. A secondary credit
+minimum now is `now before_expiry`; otherwise the best later moment worth the minimum is planned;
+if there is none, it is `let_expire`. When several moments are about as good, the later one wins,
+so the option stays open, unless the pool is dry now. The pool counts as surplus as soon as the
+one week baseline loses `burn_floor_units`, so a full credit is kept while room expires unused,
+even when a dry stretch follows later (it is planned again once the surplus has passed). A secondary credit
 is kept (`switch_instead`) while another account still has room in that window and in its week.
 Rows carry `clears_pct`, `share` and `now_since`; pass the earlier rows as `previous` to keep a
 `now` stable from one call to the next.
@@ -223,8 +226,12 @@ python -m quotapilot read --source 'ssh box python -m quotapilot snapshot' --sou
 Each `--source` is a snapshot file, or a shell command that prints one. The freshest reading per
 account wins, the server's samples count in the pace (`--pace` overrides it), and a last good
 reading stands 60 minutes (`Config.last_good_max_min`) after a failed fetch. A source that fails
-prints one error line on stderr and exits 2 with nothing on stdout. In Python, use `Snapshot`,
-`merge`, `snapshot_dumps` and `snapshot_loads`.
+prints one error line on stderr and exits 2 with nothing on stdout. `snapshot` also takes
+`--credits FILE` (a JSON list of credits: account, id, kind, expires, left, usable) and carries only
+the last 7 days of `--samples`. In Python, use `Snapshot`,
+`merge`, `snapshot_dumps` and `snapshot_loads`. Limits: a reading not marked stale does not age by itself, a credit absent from
+the freshest snapshot is still kept from an older one, and `expired_room` counts any drop of the
+percent, a credit spend included.
 
 ## What it does not do
 

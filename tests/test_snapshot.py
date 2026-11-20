@@ -227,3 +227,94 @@ def test_cli_snapshot_with_a_fake_binary_and_samples(tmp_path: Path):
     s = snapshot_loads(r.stdout)
     assert s.source == "box" and s.accounts[0].used_pct == 30 and s.accounts[0].fetched_at
     assert [x[1:] for x in s.samples] == [("2", 25.0)]
+
+
+@pytest.mark.parametrize("field", ["used_pct", "secondary_pct"])
+@pytest.mark.parametrize("bad", ["12", True, [1]])
+def test_a_non_numeric_percent_is_a_value_error_at_load(field: str, bad: Any):
+    obj = to_json(snap("a", NOW, [acc("1", 50.0)]))
+    obj["accounts"][0][field] = bad
+    with pytest.raises(ValueError, match=field):
+        from_json(obj)
+
+
+def test_cli_read_reports_a_bad_percent_and_exits_2(tmp_path: Path):
+    obj = to_json(snap("a", NOW, [acc("1", 50.0)]))
+    obj["accounts"][0]["used_pct"] = "high"
+    (tmp_path / "a.json").write_text(json.dumps(obj), encoding="utf-8")
+    r = _run("read", "--source", "a.json", cwd=tmp_path)
+    assert r.returncode == 2 and r.stdout == ""
+    assert r.stderr.startswith("quotapilot:") and "Traceback" not in r.stderr
+
+
+def _fake_cswap(tmp_path: Path) -> Path:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "accounts": [
+            {
+                "number": 2,
+                "usageStatus": "ok",
+                "usage": {
+                    "sevenDay": {"pct": 30, "resetsAt": (now + timedelta(days=2)).isoformat()}
+                },
+                "usageFetchedAt": now.isoformat(),
+            }
+        ]
+    }
+    (tmp_path / "list.json").write_text(json.dumps(payload), encoding="utf-8")
+    fake = tmp_path / "fakeswap.py"
+    fake.write_text("import sys\nprint(open('list.json').read())\n", encoding="utf-8")
+    wrapper = tmp_path / "fakeswap"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_cli_snapshot_cuts_samples_to_the_last_7_days(tmp_path: Path):
+    now = datetime.now(timezone.utc)
+    rows = [
+        [(now - timedelta(days=9)).isoformat(), "2", 10],
+        [(now - timedelta(days=6)).isoformat(), "2", 20],
+        [(now - timedelta(hours=1)).isoformat(), "2", 25],
+    ]
+    (tmp_path / "samples.json").write_text(json.dumps(rows), encoding="utf-8")
+    r = _run(
+        "snapshot", "--binary", str(_fake_cswap(tmp_path)), "--samples", "samples.json",
+        cwd=tmp_path,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    assert [x[2] for x in snapshot_loads(r.stdout).samples] == [20.0, 25.0]
+
+
+def test_cli_snapshot_carries_credits_from_a_file(tmp_path: Path):
+    credits = [
+        {
+            "account": "2",
+            "id": "c1",
+            "kind": "full",
+            "expires": "2026-12-31T00:00:00+00:00",
+            "left": 1,
+            "usable": True,
+        }
+    ]
+    (tmp_path / "credits.json").write_text(json.dumps(credits), encoding="utf-8")
+    r = _run(
+        "snapshot", "--binary", str(_fake_cswap(tmp_path)), "--credits", "credits.json",
+        cwd=tmp_path,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    got = snapshot_loads(r.stdout).credits
+    assert [(c.account, c.id, c.kind) for c in got] == [("2", "c1", "full")]
+
+
+@pytest.mark.parametrize("content", ["not json", '{"a": 1}', '[{"account": "2"}]', None])
+def test_cli_snapshot_bad_credits_file_exits_2(tmp_path: Path, content: str | None):
+    if content is not None:
+        (tmp_path / "credits.json").write_text(content, encoding="utf-8")
+    r = _run(
+        "snapshot", "--binary", str(_fake_cswap(tmp_path)), "--credits", "credits.json",
+        cwd=tmp_path,
+    )  # fmt: skip
+    assert r.returncode == 2 and r.stdout == ""
+    assert r.stderr.startswith("quotapilot:") and "Traceback" not in r.stderr
+    assert len(r.stderr.strip().splitlines()) == 1
