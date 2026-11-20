@@ -123,6 +123,8 @@ class _Sim:
         self.ceiling: dict[str, list[bool]] = {}
         self.lost = 0.0  # natural loss, resets inside the first week
         self.first_loss: dict[str, float] = {}
+        # points a spend gave back, by (account, hours after now of the spend)
+        self.cleared: dict[tuple[str, float], float] = {}
 
 
 def _simulate(
@@ -184,11 +186,12 @@ def _simulate(
                 w[2] += week
                 changed = True
         while pi < len(pend) and pend[pi][0] <= t + _EPS:
-            _, name, _kind = pend[pi]
+            at_h, name, _kind = pend[pi]
             pi += 1
             for w in ws:
                 if w[0] == name:
                     w[3] = max(0.0, cap - w[1])
+                    out.cleared.setdefault((name, round(at_h, 6)), w[3])
                     w[1] = cap
                     if config.credit_semantics == "restart_window":
                         w[2] = t + week
@@ -285,6 +288,38 @@ def _full_value(
     return track.sim(end, [*list(planned), (c.account, at, "full")]).consumed - base
 
 
+_REASONS = {
+    "dry": "pool_dry",
+    "ceiling": "ceiling_runway",
+    "now": "best_now",
+    "after_spend": "after_planned_spend",
+    "after_reset": "after_natural_reset",
+    "last": "before_expiry",
+}
+
+
+def _pick(
+    pool: Sequence[float],
+    vals: dict[float, float],
+    dry_start: float | None,
+    cfg: Config,
+) -> float:
+    """Among the moments of `pool`, the ones within `plan_tie_pct` of the best value are ties.
+
+    A dry stretch that starts now and a tied moment now: the earliest tied moment. Else the
+    latest tied moment at or before the dry start (the option stays open), else the earliest
+    tied moment. With no dry stretch at all, the latest tied moment.
+    """
+    best = max(vals[t] for t in pool)
+    ties = sorted(t for t in pool if vals[t] >= best - cfg.plan_tie_pct)
+    if dry_start is None:
+        return ties[-1]
+    if dry_start <= cfg.plan_now_tol_h and ties[0] <= cfg.plan_now_tol_h:
+        return ties[0]
+    before = [t for t in ties if t <= dry_start + _EPS]
+    return before[-1] if before else ties[0]
+
+
 def _choose(
     track: _Track,
     c: Credit,
@@ -293,8 +328,8 @@ def _choose(
     now_spent: bool,
     kind: str,
     blocked: Callable[[str, datetime], bool] | None,
-    zero_pace_reason: str | None,
 ) -> dict[str, Any]:
+    """Pick when to spend `c` on `track`, or why not (the rules are in `plan_credits`)."""
     cfg = track.config
     now = track.now
     base = track.sim(end, planned, blocked)
@@ -323,50 +358,65 @@ def _choose(
         add(t, "after_reset")
     if limit > _EPS:
         add(limit, "last")
-    cache: dict[float, float] = {}
+    cache: dict[float, tuple[float, float]] = {}
 
-    def value(t: float) -> float:
+    def value(t: float) -> tuple[float, float]:
+        """(value, clears) of spending at `t`."""
         key = round(t, 6)
         if key not in cache:
             spend = (c.account, now + timedelta(hours=key), kind)
-            cache[key] = track.sim(end, [*list(planned), spend], blocked).consumed - base.consumed
+            sim = track.sim(end, [*list(planned), spend], blocked)
+            cache[key] = (sim.consumed - base.consumed, sim.cleared.get((c.account, key), 0.0))
         return cache[key]
 
-    now_value = value(0.0)
-    vals = {t: value(t) for t in cands}
-    best = max(vals.values()) if vals else 0.0
-    soon = _hours(c.expires - now) <= cfg.credit_expiry_margin_h
-    if best < cfg.plan_min_value_pct:
-        if soon:
-            reason = zero_pace_reason or "nothing_to_recover"
-        else:
-            reason = zero_pace_reason or "no_gain_at_pace"
-        return {
-            "decision": "let_expire" if soon else "keep",
+    now_value, now_clears = value(0.0)
+    vals = {t: value(t)[0] for t in cands}
+    minimum = cfg.plan_min_value_pct
+    dry_start = base.dry[0][0] if base.dry else None
+
+    def result(
+        decision: str, reason: str, t: float | None, data_t: float | None = None
+    ) -> dict[str, Any]:
+        """The answer; the value, what it clears and its share are those of `data_t`."""
+        out: dict[str, Any] = {
+            "decision": decision,
             "reason": reason,
-            "at": None,
+            "at": None if t is None else now + timedelta(hours=t),
             "value": 0.0,
             "now_value": now_value,
+            "clears": None,
+            "share": None,
         }
-    ties = [t for t, v in vals.items() if v >= max(best - cfg.plan_tie_pct, cfg.plan_min_value_pct)]
-    pick = min(ties, key=lambda t: (cands[t] != "dry", t))
-    tag = cands[pick]
-    reason = {
-        "dry": "pool_dry",
-        "ceiling": "ceiling_runway",
-        "now": "best_now",
-        "after_spend": "after_planned_spend",
-        "after_reset": "after_natural_reset",
-        "last": "before_expiry",
-    }[tag]
-    decision = "now" if pick <= cfg.plan_now_tol_h else "planned"
-    return {
-        "decision": decision,
-        "reason": reason,
-        "at": now + timedelta(hours=pick),
-        "value": now_value if decision == "now" else vals[pick],
-        "now_value": now_value,
-    }
+        d = t if data_t is None else data_t
+        if d is not None:
+            out["value"], out["clears"] = vals[d], value(d)[1]
+            out["share"] = _share(vals[d], out["clears"])
+        return out
+
+    if _hours(c.expires - now) <= cfg.credit_expiry_margin_h:
+        # inside the margin the share is waived: a spend worth the minimum is never wasted
+        if now_value >= minimum:
+            return result("now", "before_expiry", 0.0)
+        eligible = [t for t in vals if vals[t] >= minimum]
+        if not eligible:
+            return result("let_expire", "nothing_to_recover", None)
+    else:
+        # outside the margin: worth the minimum AND a fair share of what the spend clears
+        floor = cfg.credit_min_value_share - _EPS
+        eligible = [t for t in vals if vals[t] >= minimum and _share(vals[t], value(t)[1]) >= floor]
+        if not eligible:
+            best_t = max(vals, key=lambda t: (vals[t], -t))
+            if round(vals[best_t], 1) > 0:
+                return result("keep", "low_share", None, best_t)
+            return result("keep", "pool_fine" if not base.dry else "no_gain_at_pace", None)
+    pick = _pick(eligible, vals, dry_start, cfg)
+    if pick <= cfg.plan_now_tol_h:
+        return result("now", _REASONS[cands[pick]], pick, 0.0)
+    return result("planned", _REASONS[cands[pick]], pick)
+
+
+def _share(value: float, clears: float) -> float:
+    return value / clears if clears > _EPS else 0.0
 
 
 def _reset_moments(track: _Track, limit: float) -> list[float]:
@@ -402,14 +452,36 @@ def plan_credits(
     profile: Sequence[float] | None = None,
     secondary_pace: float | None = None,
     mode: str | None = None,
+    previous: Sequence[dict[str, Any]] | None = None,
     config: Config = DEFAULT,
 ) -> dict[str, Any]:
     """Plan when to spend each live on-demand reset credit, by forward simulation.
 
     The pool drains at `pace` points per hour (shaped by `profile`, 24 UTC hourly factors of
     mean 1.0) from the window with the soonest reset. The value of a spend is the extra points
-    served over the horizon. Credits are planned in order of expiry and each plan counts the
-    spends planned before it. `mode` is only passed through as `input_mode`.
+    served over the horizon; what it CLEARS is the points it gives back (the window's used
+    points at that moment); its share is value over clears. Credits are planned in order of
+    expiry and each plan counts the spends planned before it.
+
+    A full credit, in order. Not usable: keep. Outside `credit_expiry_margin_h` of its expiry
+    and the pool in surplus (`mode` is "surplus", or none is passed and the plan's own one week
+    baseline is surplus): keep `pool_surplus`. Outside the margin a moment is eligible when its
+    value is at least `plan_min_value_pct` and its share at least `credit_min_value_share`;
+    none eligible is `keep low_share` when something above 0 could be recovered, else
+    `keep pool_fine` when the pool is never dry, else `keep no_gain_at_pace`. Inside the margin
+    the share is waived: a now value of at least the minimum is `now before_expiry`, else the
+    best later moment worth the minimum is planned, else `let_expire`. Among eligible moments
+    those within `plan_tie_pct` of the best tie: a dry stretch starting now wins now, else the
+    latest tie at or before the dry start (the option stays open), else the earliest.
+
+    A secondary credit, in order: not usable keep; no `secondary_pace` fallback; a zero pace
+    `keep no_secondary_work`; its window not spent `keep not_spent`; another account with
+    secondary and weekly room `keep switch_instead`; its own weekly room under
+    `secondary_min_room_pct` `keep weekly_spent`; then the same rules on the secondary pool.
+
+    Each row carries `clears_pct`, `share` and, for a `now`, `now_since`: kept from the same
+    credit in `previous` (the rows of an earlier call) when it was already `now`, else now.
+    `mode` is also passed through as `input_mode`.
     """
     _aware(now, "now")
     for acc in accounts:
@@ -443,6 +515,7 @@ def plan_credits(
     rows: list[dict[str, Any]] = []
     horizon = timedelta(hours=config.plan_horizon_h)
     week = timedelta(hours=config.week_hours)
+    surplus: bool | None = None
     for c in live:
         a = by_name.get(c.account)
         full = c.kind == "full"
@@ -458,6 +531,9 @@ def plan_credits(
             "reason": "account_unread",
             "hours_to_reset_at_plan": None,
             "hours_to_expiry": round(_hours(c.expires - now), 1),
+            "clears_pct": None,
+            "share": None,
+            "now_since": None,
         }
         rows.append(row)
         win = _window(a, not full) if a is not None else None
@@ -469,12 +545,23 @@ def plan_credits(
         if not full and sec is None:
             row.update(decision="fallback", reason="no_secondary_history")
             continue
-        end = min(now + horizon, c.expires + week)
         assert a is not None
+        if full:
+            if _hours(c.expires - now) > config.credit_expiry_margin_h:
+                if surplus is None:
+                    surplus = (mode or _baseline_mode(main, now, config)) == "surplus"
+                if surplus:
+                    row.update(decision="keep", reason="pool_surplus")
+                    continue
+        else:
+            gate = _secondary_gate(a, accounts, secondary_pace, now, config)
+            if gate is not None:
+                row.update(decision="keep", reason=gate)
+                continue
+        end = min(now + horizon, c.expires + week)
         if full:
             track = main
             blocked = None
-            zero = None
             now_spent = win[1] >= config.spent_pct
             spends_in = planned_full
         else:
@@ -489,17 +576,21 @@ def plan_credits(
                 i = min(len(mask) - 1, max(0, round(_hours(t - now) / config.plan_step_h)))
                 return mask[i]
 
-            zero = "no_secondary_work" if secondary_pace == 0 else None
             now_spent = win[1] >= config.spent_pct
             spends_in = planned_all
-        res = _choose(track, c, spends_in, end, now_spent, c.kind, blocked, zero)
+        res = _choose(track, c, spends_in, end, now_spent, c.kind, blocked)
         at = res["at"]
+        reason = res["reason"]
+        if not full and res["decision"] == "now":
+            reason = "secondary_spent_weekly_room"
         row.update(
             decision=res["decision"],
-            reason=res["reason"],
+            reason=reason,
             planned_at=_iso(at) if at else None,
             value_pct=round(res["value"], 1),
             now_value_pct=round(res["now_value"], 1),
+            clears_pct=None if res["clears"] is None else round(res["clears"], 1),
+            share=None if res["share"] is None else round(res["share"], 2),
         )
         if at is not None:
             _, _, reset = win
@@ -507,6 +598,8 @@ def plan_credits(
             planned_all.append((c.account, at, c.kind))
             if full:
                 planned_full.append((c.account, at, "full"))
+        if res["decision"] == "now":
+            row["now_since"] = _now_since(row, previous, now)
     return {
         "credits": rows,
         "forecast": _week(main, planned_full, rows, now, config),
@@ -514,6 +607,59 @@ def plan_credits(
         "pace_pct_h": pace,
         "input_mode": mode,
     }
+
+
+def _baseline_mode(main: _Track, now: datetime, config: Config) -> str:
+    """The mode of the main pool's own one week baseline (no credit spent)."""
+    sim = main.sim(now + timedelta(hours=config.week_hours), [])
+    return _mode(sim.lost, sim.dry_hours, config)
+
+
+def _now_since(
+    row: dict[str, Any], previous: Sequence[dict[str, Any]] | None, now: datetime
+) -> str:
+    """When this `now` began: the earlier call's `now_since` if the same credit was already now."""
+    for p in previous or []:
+        if (p.get("account"), p.get("id")) != (row["account"], row["id"]):
+            continue
+        since = p.get("now_since")
+        if p.get("decision") == "now" and since:
+            try:
+                if datetime.fromisoformat(since) <= now:
+                    return str(since)
+            except ValueError:
+                pass
+    return _iso(now)
+
+
+def _secondary_gate(
+    a: Account,
+    accounts: Sequence[Account],
+    secondary_pace: float | None,
+    now: datetime,
+    config: Config,
+) -> str | None:
+    """The reason a secondary credit is kept before any simulation, or None to simulate."""
+    cap = config.spent_pct
+    if secondary_pace == 0:
+        return "no_secondary_work"
+    assert a.secondary_pct is not None and a.secondary_reset is not None
+    if a.secondary_pct < cap and a.secondary_reset > now:
+        return "not_spent"
+    for o in accounts:
+        if o.name == a.name or not o.usable or o.secondary_pct is None or o.secondary_reset is None:
+            continue
+        secondary_room = o.secondary_pct < cap or o.secondary_reset <= now
+        weekly_room = (
+            o.used_pct is not None and o.reset is not None and (o.used_pct < cap or o.reset <= now)
+        )
+        if secondary_room and weekly_room:
+            return "switch_instead"
+    if a.used_pct is not None and a.reset is not None:
+        room = cap if a.reset <= now else cap - a.used_pct
+        if room < config.secondary_min_room_pct:
+            return "weekly_spent"
+    return None
 
 
 def _week(

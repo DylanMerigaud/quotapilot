@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
+
+- The smart rule of `plan_credits`: a reset is spent only when it buys something. Three defaults
+  changed, because 0.4.0 asked for a reset to recover almost nothing (a card for 2 points on an
+  83 point reset): `plan_min_value_pct` 1.0 to 10.0, `credit_expiry_margin_h` 24 to 48, and the
+  new `credit_min_value_share` 0.5 (a spend must recover at least half of what it clears).
+  Outside the expiry margin a pool in surplus keeps the credit (`pool_surplus`); a value under the
+  minimum or the share is `keep low_share`; a pool that is never dry is `keep pool_fine`; a dry
+  stretch the credit cannot help is `keep no_gain_at_pace`. Inside the margin the share is waived:
+  a spend worth the minimum is `now before_expiry`, else `let_expire`. Ties between moments go
+  toward the later one (the option stays open), unless the pool is dry now.
+- A secondary (for example Fable) credit is kept with `not_spent`, `no_secondary_work`,
+  `switch_instead` (another account has secondary and weekly room: switch, do not reset) or
+  `weekly_spent` before any simulation, and a `now` says `secondary_spent_weekly_room`.
+- Plan rows gain `clears_pct`, `share` and `now_since`; `plan_credits(..., previous=rows)` keeps
+  the `now_since` of a credit that was already `now`.
+- `capacity_view(accounts, pace, now, ...)`: the pool's capacity in points an hour against the
+  pace, the unused points in accounts' worth, a verdict (`short`, `drop_one`, `consume_more`,
+  `balanced`) and the picture after each known end date. `expired_room(samples, now)`: the
+  points each account let expire at its resets.
 
 - `Snapshot`, `merge`, `snapshot_dumps`, `snapshot_loads` (module `quotapilot.snapshot`: `to_json`,
   `from_json`, `dumps`, `loads`): what one machine read, as JSON (schema 1), and the merge of

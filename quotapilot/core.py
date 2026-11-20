@@ -57,12 +57,13 @@ class Config:
     history_h: float = 24
     secondary_hold_h: float = 24
     short_min_h: float = 1.0
-    credit_expiry_margin_h: float = 24
+    credit_expiry_margin_h: float = 48
     credit_min_lead_h: float = 24
     spent_pct: float = 99.0
     plan_step_h: float = 0.25
     plan_horizon_h: float = 672  # 28 days
-    plan_min_value_pct: float = 1.0  # a spend recovering less is never planned
+    plan_min_value_pct: float = 10.0  # a spend recovering less is never planned
+    credit_min_value_share: float = 0.5  # and its value must be this share of what it clears
     plan_tie_pct: float = 0.5  # candidates within this of the best are ties
     plan_now_tol_h: float = 0.25  # planned within this of now means "now"
     plan_expiry_guard_h: float = 1.0  # the last chance candidate is expiry minus this

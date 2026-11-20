@@ -1,5 +1,6 @@
 """quotapilot: where to burn the weekly quota of several accounts so the least expires."""
 
+from .capacity import capacity_view, expired_room
 from .core import (
     Account,
     Config,
@@ -17,7 +18,7 @@ from .snapshot import Snapshot, merge
 from .snapshot import dumps as snapshot_dumps
 from .snapshot import loads as snapshot_loads
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Account",
@@ -26,7 +27,9 @@ __all__ = [
     "Snapshot",
     "advise_credits",
     "average_pace",
+    "capacity_view",
     "decide",
+    "expired_room",
     "forecast",
     "merge",
     "pace_band",

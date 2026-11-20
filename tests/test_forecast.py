@@ -117,7 +117,7 @@ def test_first_windows_match_project(pace):
 
 
 def test_version_and_exports():
-    assert quotapilot.__version__ == "0.4.0"
+    assert quotapilot.__version__ == "0.5.0"
     assert "forecast" in quotapilot.__all__ and "pace_band" in quotapilot.__all__
 
 

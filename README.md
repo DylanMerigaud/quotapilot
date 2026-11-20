@@ -105,15 +105,15 @@ secondary_pace=None)` looks ahead: it simulates the pool step by step (`plan_ste
 over up to `plan_horizon_h` (28 days), demand drained from the window with the soonest reset, and
 says for each live credit when to spend it: `now`, `planned` (with `planned_at`), `keep`
 (nothing worth recovering at this pace, so far from expiry it is kept and re-planned later),
-`let_expire` (the same, but the credit expires within `credit_expiry_margin_h`, 24 hours), `fallback` (a secondary credit without a secondary pace: use `advise_credits`) or
+`let_expire` (the same, but the credit expires within `credit_expiry_margin_h`, 48 hours), `fallback` (a secondary credit without a secondary pace: use `advise_credits`) or
 `unknown`, with a reason.
 
 The value of a spend at time s is the extra points the pool serves over the horizon with the
 credit spent at s than without it. Candidates are the moments that can matter: now, the pool going dry,
 the account hitting its ceiling, each natural reset, each spend already planned, and the last
 chance before expiry. A plan under
-`plan_min_value_pct` (1 point) is never made; candidates within `plan_tie_pct` of the best are
-ties, settled for a dry moment first, then the earliest. Credits are planned in order of expiry
+`plan_min_value_pct` (10 points) is never made; candidates within `plan_tie_pct` of the best are
+ties, settled toward the later moment (see below). Credits are planned in order of expiry
 and each plan counts the spends planned before it. The result also carries a week `forecast` with
 and without the planned credits (`covered_hours`, `covered_by`).
 
@@ -134,6 +134,42 @@ credits = [Credit("4", "full-reset-2611", "full", now + timedelta(days=12))]
 row = plan_credits(accounts, credits, 1.5, now)["credits"][0]
 print(row["decision"], row["reason"], row["value_pct"])  # now pool_dry 99.0
 ```
+
+## When a reset is worth spending (0.5.0)
+
+`plan_credits` keeps a credit unless spending it buys something. A moment is worth it when the
+points it gives back to the pool are at least `plan_min_value_pct` (10) and at least
+`credit_min_value_share` (half) of what the spend clears: a reset that clears 83 points to recover
+2 is `keep low_share`. A pool that is never dry has nothing to recover (`keep pool_fine`), and a
+pool that is already losing room at its natural resets is in surplus (`keep pool_surplus`). Within
+`credit_expiry_margin_h` (48 hours) of its expiry the share no longer matters: a spend worth the
+minimum is `now before_expiry`, anything less is `let_expire`. When several moments are about as
+good, the later one wins, so the option stays open, unless the pool is dry now. A secondary credit
+is kept (`switch_instead`) while another account still has room in that window and in its week.
+Rows carry `clears_pct`, `share` and `now_since`; pass the earlier rows as `previous` to keep a
+`now` stable from one call to the next.
+
+## Drop an account or consume more (0.5.0)
+
+`capacity_view` compares what the pool can serve with what you ask of it:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from quotapilot import Account, capacity_view
+
+now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+accounts = [Account(n, 40, now + timedelta(hours=60 + 20 * i)) for i, n in enumerate("abcd")]
+view = capacity_view(accounts, 1.6, now, prior_pace=1.6, expired={"a": 95.0}, prices={"a": 200.0})
+print(view["capacity_pct_h"], view["unused_pct_h"], view["unused_week_pct"])  # 2.36 0.76 128
+print(view["verdict"], view["drop"])  # drop_one {'account': 'a', 'expired_pct': 95.0, ...}
+```
+
+The verdict is `short` when the pace is above capacity, `drop_one` when a whole account's week
+went unused this week and the week before (`drop` names the account that let the most room expire
+and what it saves a month), `consume_more` when under that but room is lost, else `balanced`.
+Pass `ends={"b": end_date}` to see the picture after an account ends. `expired_room(samples,
+now)` measures the room each account let expire. It is a reading: nothing is capped.
 
 ## With claude-swap
 

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from quotapilot import Account, Config, Credit, pace_profile, plan_credits
-from quotapilot.plan import _full_value, _Track, _window
+from quotapilot.plan import _Track, _window
 
 UTC = timezone.utc
 NOW = datetime(2026, 11, 19, 0, 0, tzinfo=UTC)
@@ -111,7 +111,9 @@ def test_h_second_credit_sees_the_first_spend():
     credits = [Credit("A", "a", "full", h(300)), Credit("B", "b", "full", h(310))]
     out = plan(accounts, credits, 1)["credits"]
     assert out[0]["decision"] == "now"
-    assert out[1]["decision"] == "planned" and off(out[1]) > 10
+    # once A is spent, B's spend is worth 1 point: under the minimum of 10 (0.4.0 planned it)
+    assert (out[1]["decision"], out[1]["reason"]) == ("keep", "low_share")
+    assert out[1]["value_pct"] < 10
 
 
 def test_i_forecast_covered_hours():
@@ -184,8 +186,28 @@ def test_unknown_not_usable_and_dead_credits():
 
 
 def test_long_expiry_no_gain_is_keep():
+    # the pool loses 90 points at its reset in the week: surplus, kept (0.4.0 said no_gain_at_pace)
     r = first(plan([Account("A", 0, h(100))], [full(2000)], 0.1))
-    assert (r["decision"], r["reason"]) == ("keep", "no_gain_at_pace")
+    assert (r["decision"], r["reason"]) == ("keep", "pool_surplus")
+
+
+def _eligible_best(track, c, planned, end, times, cfg):
+    """Best value over grid moments that the rules let through: the minimum, and the share of
+    what the spend clears unless the credit is inside the expiry margin."""
+    soon = (c.expires - NOW).total_seconds() / 3600 <= cfg.credit_expiry_margin_h
+    best = 0.0
+    for t in times:
+        if t > (c.expires - NOW).total_seconds() / 3600 - cfg.plan_expiry_guard_h:
+            continue
+        spend = (c.account, h(t), "full")
+        base = track.sim(end, planned)
+        sim = track.sim(end, [*planned, spend])
+        v = sim.consumed - base.consumed
+        clears = sim.cleared.get((c.account, round(t, 6)), 0.0)
+        share = v / clears if clears > 0 else 0.0
+        if v >= cfg.plan_min_value_pct and (soon or share >= cfg.credit_min_value_share):
+            best = max(best, v)
+    return best
 
 
 @pytest.mark.parametrize("seed", range(40))
@@ -206,21 +228,23 @@ def test_property_full_credit(seed):
     row = first(plan_credits(accounts, [c], pace, NOW, config=cfg))
     if row["decision"] in ("now", "planned"):
         assert row["value_pct"] >= cfg.plan_min_value_pct
+    if row["reason"] == "pool_surplus":
+        return
     track = _Track([w for w in (_window(a, False) for a in accounts) if w], pace, None, NOW, cfg)
     end = min(h(cfg.plan_horizon_h), c.expires + timedelta(hours=cfg.week_hours))
-    best = 0.0
-    t = 0.0
-    while t <= exp - cfg.plan_expiry_guard_h:
-        best = max(best, _full_value(track, c, h(t), [], end))
-        t += 6
+    best = _eligible_best(track, c, [], end, [t * 6.0 for t in range(int(exp // 6) + 1)], cfg)
+    if exp <= cfg.credit_expiry_margin_h and _eligible_best(track, c, [], end, [0.0], cfg) > 0:
+        # inside the margin a now worth the minimum is spent now, whatever a later moment is worth
+        assert (row["decision"], row["reason"]) == ("now", "before_expiry")
+        return
     if best >= cfg.plan_min_value_pct + 1.0:
         assert row["decision"] in ("now", "planned")
         assert row["value_pct"] >= best - 1.0
 
 
 def test_r1_tie_set_never_below_the_minimum():
-    r = first(plan([Account("A", 100, h(1.0))], [Credit("A", "c", "full", h(3.75))], 0.6))
-    assert r["decision"] == "planned" and r["value_pct"] >= 1.0
+    r = first(plan([Account("A", 100, h(1.0))], [Credit("A", "c", "full", h(3.75))], 8))
+    assert r["decision"] == "planned" and r["value_pct"] >= 10.0
     assert off(r) == pytest.approx(2.75, abs=0.25)
 
 
@@ -229,7 +253,8 @@ def test_r2_candidates_include_other_planned_spends():
     credits = [Credit("B", "b", "full", h(58)), Credit("A", "a", "full", h(310))]
     out = plan(accounts, credits, 2)["credits"]
     assert out[0]["id"] == "b" and off(out[0]) == pytest.approx(11.5, abs=0.25)
-    assert off(out[1]) == pytest.approx(11.5, abs=0.5) and out[1]["value_pct"] > 90
+    # 11.5 and 18 tie (97 each): the latest tie before the dry stretch wins (0.5.0, ties later)
+    assert off(out[1]) == pytest.approx(18, abs=0.5) and out[1]["value_pct"] > 90
 
 
 def test_r3_now_is_always_a_candidate():
@@ -243,14 +268,15 @@ def test_r3_now_is_always_a_candidate():
 def test_r4_let_expire_only_near_expiry():
     acc = [Account("A", 0, h(100))]
     near = first(plan(acc, [full(20)], 0.1))
-    far = first(plan(acc, [full(300)], 0.1))
+    far = first(plan(acc, [full(300)], 0.1, mode="on_track"))
     assert (near["decision"], near["reason"]) == ("let_expire", "nothing_to_recover")
-    assert (far["decision"], far["reason"]) == ("keep", "no_gain_at_pace")
+    assert (far["decision"], far["reason"]) == ("keep", "pool_fine")
     sacc = [Account("A", 10, h(100), 100, h(100))]
     s = first(plan(sacc, [Credit("A", "s", "secondary", h(300))], 1, secondary_pace=0))
     assert (s["decision"], s["reason"]) == ("keep", "no_secondary_work")
+    # 0.5.0 (S3): a zero secondary pace is a keep before any simulation, even near expiry
     s = first(plan(sacc, [Credit("A", "s", "secondary", h(20))], 1, secondary_pace=0))
-    assert (s["decision"], s["reason"]) == ("let_expire", "no_secondary_work")
+    assert (s["decision"], s["reason"]) == ("keep", "no_secondary_work")
 
 
 def test_r5_validation():
@@ -303,10 +329,12 @@ def test_r6_second_credit_matches_grid_max():
             [w for w in (_window(a, False) for a in accounts) if w], pace, None, NOW, cfg
         )
         end = min(h(cfg.plan_horizon_h), c2.expires + timedelta(hours=cfg.week_hours))
+        if rows[1]["reason"] == "pool_surplus" or e2 <= cfg.credit_expiry_margin_h:
+            continue
         times = [t * 6.0 for t in range(int((e2 - 1) // 6) + 1)]
         if planned:
             times.append(_hours_of(planned[0][1]))
-        best = max(_full_value(track, c2, h(t), planned, end) for t in times if t <= e2 - 1.0)
+        best = _eligible_best(track, c2, planned, end, times, cfg)
         if best >= cfg.plan_min_value_pct + 1.0:
             checked += 1
             assert rows[1]["decision"] in ("now", "planned")
@@ -316,3 +344,181 @@ def test_r6_second_credit_matches_grid_max():
 
 def _hours_of(dt):
     return (dt - NOW).total_seconds() / 3600
+
+
+# ---- 0.5.0: the smart rules (minimum value, share, ties toward later, switch instead) ----
+
+
+def acc(name, used, reset_h, sec=None, sec_reset_h=None, **kw):
+    return Account(
+        name,
+        used,
+        h(reset_h),
+        secondary_pct=sec,
+        secondary_reset=None if sec_reset_h is None else h(sec_reset_h),
+        **kw,
+    )
+
+
+S1_POOL = [acc("4", 99, 56), acc("2", 83, 86), acc("1", 4, 128), acc("3", 0, 134)]
+
+
+def test_smart_defaults():
+    cfg = Config()
+    assert cfg.plan_min_value_pct == 10.0
+    assert cfg.credit_expiry_margin_h == 48
+    assert cfg.credit_min_value_share == 0.5
+
+
+def test_low_share_row_carries_value_clears_and_share():
+    c = Credit("2", "c", "full", h(493))
+    r = first(plan(S1_POOL, [c], 2.5))
+    assert (r["decision"], r["reason"]) == ("keep", "low_share")
+    assert 0 < r["value_pct"] < 10
+    assert r["clears_pct"] == pytest.approx(83, abs=1)
+    assert r["share"] is not None and r["share"] < 0.5
+    assert r["now_since"] is None
+
+
+def test_a_value_under_the_minimum_ten_is_never_planned():
+    r = first(plan([Account("A", 0, h(96))], [full(300)], 0.6, mode="short"))
+    assert (r["decision"], r["reason"]) == ("keep", "low_share")
+    assert r["value_pct"] < 10
+
+
+def test_a_value_of_ten_or_more_but_under_half_of_what_it_clears_is_low_share():
+    r = first(plan([acc("A", 80, 60)], [full(60)], 0.5))
+    assert (r["decision"], r["reason"]) == ("keep", "low_share")
+    assert r["value_pct"] >= 10 and r["clears_pct"] == pytest.approx(80, abs=1)
+    assert r["share"] == pytest.approx(r["value_pct"] / r["clears_pct"], abs=0.01)
+    assert r["share"] < 0.5
+
+
+def test_pool_fine_when_the_pool_is_never_dry():
+    accounts = [acc("A", 0, 100), acc("B", 0, 120)]
+    r = first(plan(accounts, [full(300)], 0.1, mode="on_track"))
+    assert (r["decision"], r["reason"]) == ("keep", "pool_fine")
+    assert r["clears_pct"] is None and r["share"] is None
+
+
+def test_no_gain_at_pace_when_the_pool_runs_dry_and_the_credit_cannot_help():
+    # restart_window: spending moves the reset a week out, which costs the natural refill
+    cfg = Config(credit_semantics="restart_window", plan_step_h=1.0)
+    r = first(plan([acc("A", 20, 40)], [full(60)], 2, config=cfg))
+    assert (r["decision"], r["reason"]) == ("keep", "no_gain_at_pace")
+    assert r["clears_pct"] is None and r["share"] is None
+
+
+def test_inside_the_margin_a_now_value_of_ten_is_before_expiry_whatever_the_share():
+    accounts = [acc("A", 60, 40), acc("B", 99, 66)]
+    r = first(plan(accounts, [full(20)], 3))
+    assert (r["decision"], r["reason"]) == ("now", "before_expiry")
+    assert r["value_pct"] >= 10
+    assert r["now_since"] is not None
+
+
+def test_inside_the_margin_nothing_to_recover_is_let_expire():
+    accounts = [acc("A", 60, 40), acc("B", 0, 100)]
+    r = first(plan(accounts, [full(20)], 1))
+    assert (r["decision"], r["reason"]) == ("let_expire", "nothing_to_recover")
+
+
+def test_inside_the_margin_a_better_later_moment_is_planned():
+    # 44 h to expiry (inside 48): now is worth little, the ceiling at ~20 h is worth more
+    accounts = [acc("A", 5, 100), acc("B", 99, 120)]
+    r = first(plan(accounts, [full(44)], 5))
+    assert r["decision"] in ("now", "planned")
+    assert r["value_pct"] >= 10
+
+
+def test_ties_go_toward_later_the_s6_picture():
+    accounts = [acc("A", 69, 90), acc("B", 89, 300)]
+    r = first(plan(accounts, [full(92)], 1))
+    assert (r["decision"], r["reason"]) == ("planned", "ceiling_runway")
+    assert off(r) == pytest.approx(30, abs=0.5)
+
+
+def test_a_dry_start_that_is_now_wins():
+    accounts = [acc("A", 99, 60), acc("B", 99, 80)]
+    r = first(plan(accounts, [Credit("B", "c", "full", h(300))], 3))
+    assert (r["decision"], r["reason"]) == ("now", "pool_dry")
+    assert r["share"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_pool_surplus_by_the_mode_passed():
+    accounts = [acc("A", 99, 159), acc("B", 0, 10)]
+    r = first(plan(accounts, [full(300)], 1, mode="surplus"))
+    assert (r["decision"], r["reason"]) == ("keep", "pool_surplus")
+
+
+def test_pool_surplus_by_the_baseline_week_when_no_mode_is_passed():
+    accounts = [acc("A", 99, 159), acc("B", 0, 10)]
+    r = first(plan(accounts, [full(300)], 1))
+    assert (r["decision"], r["reason"]) == ("keep", "pool_surplus")
+
+
+def test_pool_surplus_does_not_apply_inside_the_margin():
+    accounts = [acc("A", 99, 159), acc("B", 0, 10)]
+    r = first(plan(accounts, [full(30)], 1, mode="surplus"))
+    assert r["reason"] != "pool_surplus"
+
+
+def sec(exp=2000, **kw):
+    return Credit("A", "f", "secondary", h(exp), **kw)
+
+
+def test_secondary_not_spent_when_the_window_is_under_spent_pct():
+    accounts = [acc("A", 4, 120, 5, 120)]
+    r = first(plan(accounts, [sec()], 2.5, secondary_pace=2.5))
+    assert (r["decision"], r["reason"]) == ("keep", "not_spent")
+
+
+def test_secondary_no_work_at_pace_zero():
+    accounts = [acc("A", 4, 120, 99, 120)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=0))
+    assert (r["decision"], r["reason"]) == ("keep", "no_secondary_work")
+
+
+def test_secondary_switch_instead_when_another_account_has_both_rooms():
+    accounts = [acc("A", 10, 100, 99, 100), acc("B", 10, 120, 20, 120)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=2))
+    assert (r["decision"], r["reason"]) == ("keep", "switch_instead")
+
+
+def test_secondary_no_switch_when_the_other_account_has_no_weekly_room():
+    accounts = [acc("A", 39, 100, 99, 100), acc("B", 99, 120, 20, 120)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=2))
+    assert r["reason"] != "switch_instead"
+
+
+def test_secondary_switch_ignores_an_account_without_a_secondary_window():
+    accounts = [acc("A", 10, 100, 99, 100), acc("B", 10, 120)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=2))
+    assert r["reason"] != "switch_instead"
+
+
+def test_secondary_weekly_spent():
+    accounts = [acc("A", 95, 100, 99, 100), acc("B", 10, 120, 99, 120)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=2))
+    assert (r["decision"], r["reason"]) == ("keep", "weekly_spent")
+
+
+def test_secondary_now_says_secondary_spent_weekly_room():
+    accounts = [acc("A", 39, 100, 99, 100), acc("B", 10, 120, 99, 120)]
+    r = first(plan(accounts, [sec()], 1, secondary_pace=2))
+    assert (r["decision"], r["reason"]) == ("now", "secondary_spent_weekly_room")
+
+
+def test_now_since_is_carried_while_the_verdict_holds_and_reset_when_it_changes():
+    accounts = [acc("A", 99, 60), acc("B", 99, 80)]
+    cred = [Credit("B", "c", "full", h(300))]
+    prev_at = (NOW - timedelta(minutes=45)).isoformat()
+    prev = [{"account": "B", "id": "c", "decision": "now", "now_since": prev_at}]
+    r = first(plan(accounts, cred, 3, previous=prev))
+    assert r["now_since"] == prev_at
+    r2 = first(plan(accounts, cred, 3, previous=[{**prev[0], "decision": "keep"}]))
+    assert r2["now_since"] == NOW.isoformat()
+    r3 = first(plan(accounts, cred, 3))
+    assert r3["now_since"] == NOW.isoformat()
+    r4 = first(plan([acc("A", 0, 100)], [Credit("A", "c", "full", h(300))], 0.1, previous=prev))
+    assert r4["now_since"] is None

@@ -34,7 +34,7 @@ def sec(**kw):
 
 
 def test_version_and_exports():
-    assert quotapilot.__version__ == "0.4.0"
+    assert quotapilot.__version__ == "0.5.0"
     assert "advise_credits" in quotapilot.__all__ and "Credit" in quotapilot.__all__
 
 
