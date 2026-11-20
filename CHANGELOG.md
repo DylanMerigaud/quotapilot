@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `Snapshot`, `merge`, `snapshot_dumps`, `snapshot_loads` (module `quotapilot.snapshot`: `to_json`,
+  `from_json`, `dumps`, `loads`): what one machine read, as JSON (schema 1), and the merge of
+  several: the freshest usable reading per account wins, samples are the deduplicated union,
+  credits are keyed by account and id.
+- `Account.fetched_at` and `Account.stale`; `Config.last_good_max_min` (60).
+- claude-swap adapter: a failed row carrying `lastGoodUsage` and `lastGoodFetchedAt` is read stale
+  while that reading is at most `last_good_max_min` old; `parse_list` and `read` take a `config`.
+- Command line: `python -m quotapilot snapshot` and `python -m quotapilot read --source ...`
+  (a snapshot file, or a shell command printing one), which prints the merged snapshot and a
+  forecast as JSON.
+
 ## 0.4.0
 
 - `plan_credits`: plan when to spend each on-demand reset credit by forward simulation of the

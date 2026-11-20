@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from ..core import Account
+from ..core import DEFAULT, Account, Config
 
 
 def parse_at(text: Any) -> datetime | None:
@@ -35,19 +35,38 @@ def parse_list(
     data: dict[str, Any] | list[Any],
     now: datetime | None = None,
     secondary_name: str | None = None,
+    config: Config = DEFAULT,
 ) -> list[Account]:
     """The accounts of a `cswap list --json` payload (the object, or just its `accounts` list).
 
     `secondary_name` picks the window of `usage.scoped` (the per-model weekly limits) that becomes
     the secondary window, by its `name`. None takes the first scoped window that has a percent.
-    `now` is not used to read the rows.
+    A row whose `usageStatus` is not `ok` but carries `lastGoodUsage` and `lastGoodFetchedAt` is
+    read from them, flagged `stale`, when `now` is given and that fetch is at most
+    `config.last_good_max_min` minutes old; otherwise it stays unusable. A row read with status
+    `ok` takes `fetched_at` from `usageFetchedAt` when present.
     Raises ValueError, KeyError or TypeError on a malformed row.
     """
     rows = data["accounts"] if isinstance(data, dict) else data
     accounts: list[Account] = []
     for r in rows:
         name = str(r["number"])
-        usage = r.get("usage") if r.get("usageStatus") == "ok" else None
+        stale = False
+        fetched_at: datetime | None = None
+        if r.get("usageStatus") == "ok":
+            usage = r.get("usage")
+            fetched_at = parse_at(r["usageFetchedAt"]) if r.get("usageFetchedAt") else None
+        else:
+            usage = None
+            good_at = parse_at(r["lastGoodFetchedAt"]) if r.get("lastGoodFetchedAt") else None
+            good = r.get("lastGoodUsage")
+            if (
+                now is not None
+                and good_at is not None
+                and isinstance(good, dict)
+                and now - good_at <= timedelta(minutes=config.last_good_max_min)
+            ):
+                usage, stale, fetched_at = good, True, good_at
         if usage is not None and not isinstance(usage, dict):
             raise TypeError(f"usage of {name} is {type(usage).__name__}")
         pct, reset = _window(usage, "sevenDay")
@@ -67,6 +86,8 @@ def parse_list(
                 secondary_pct=secondary_pct,
                 secondary_reset=secondary_reset,
                 usable=usage is not None and pct is not None,
+                fetched_at=fetched_at,
+                stale=stale,
             )
         )
     return accounts
@@ -77,6 +98,7 @@ def read(
     binary: str = "cswap",
     timeout: float = 120,
     secondary_name: str | None = None,
+    config: Config = DEFAULT,
 ) -> list[Account]:
     """Run `cswap list --json` and parse it. RuntimeError when it fails or is unreadable."""
     try:
@@ -87,6 +109,6 @@ def read(
         raise RuntimeError(f"cswap list exit {out.returncode}: {(out.stderr or '').strip()[:120]}")
     try:
         data = json.loads(out.stdout)
-        return parse_list(data, datetime.now(timezone.utc), secondary_name)
+        return parse_list(data, datetime.now(timezone.utc), secondary_name, config)
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise RuntimeError(f"cswap list bad json: {type(e).__name__}: {e}") from e

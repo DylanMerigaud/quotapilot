@@ -133,3 +133,45 @@ def test_read_failures_are_runtime_errors():
 
     with pytest.raises(RuntimeError, match="cswap list failed"):
         claude_swap.read(run=broken)
+
+
+def _failed_row(good_at: str | None, status: str = "error") -> dict[str, Any]:
+    row: dict[str, Any] = {"number": 7, "usageStatus": status, "usage": None}
+    if good_at is not None:
+        row["lastGoodUsage"] = {
+            "sevenDay": {"pct": 40.0, "resetsAt": "2026-11-22T17:00:00Z"},
+            "scoped": [{"name": "Fable", "pct": 20.0, "resetsAt": "2026-11-22T17:00:00Z"}],
+        }
+        row["lastGoodFetchedAt"] = good_at
+    return row
+
+
+def test_last_good_within_the_window_is_read_stale():
+    (a,) = claude_swap.parse_list([_failed_row("2026-11-18T12:40:00Z")], NOW)
+    assert a.usable and a.stale and a.used_pct == 40 and a.secondary_pct == 20
+    assert a.fetched_at == datetime(2026, 11, 18, 12, 40, tzinfo=timezone.utc)
+
+
+def test_last_good_past_the_window_stays_unusable():
+    (a,) = claude_swap.parse_list([_failed_row("2026-11-18T12:00:00Z")], NOW)
+    assert not a.usable and not a.stale and a.used_pct is None
+
+
+def test_last_good_window_follows_the_config():
+    from quotapilot import Config
+
+    row = _failed_row("2026-11-18T12:00:00Z")
+    (a,) = claude_swap.parse_list([row], NOW, config=Config(last_good_max_min=120))
+    assert a.usable and a.stale
+
+
+def test_last_good_needs_now_and_a_stamp():
+    assert not claude_swap.parse_list([_failed_row("2026-11-18T13:20:00Z")])[0].usable
+    assert not claude_swap.parse_list([_failed_row(None)], NOW)[0].usable
+
+
+def test_ok_row_takes_fetched_at_from_usage_fetched_at():
+    row = dict(PAYLOAD["accounts"][1], usageFetchedAt="2026-11-18T13:25:00Z")
+    (a,) = claude_swap.parse_list([row], NOW)
+    assert a.fetched_at == datetime(2026, 11, 18, 13, 25, tzinfo=timezone.utc) and not a.stale
+    assert claude_swap.parse_list([PAYLOAD["accounts"][1]], NOW)[0].fetched_at is None

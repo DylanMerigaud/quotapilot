@@ -170,6 +170,26 @@ print(decide(accounts, [], now)["summary"])
 `parse_list(data, secondary_name=...)` picks the per-model weekly window of `usage.scoped` by
 name for the secondary window (the first one when omitted).
 
+## Several machines
+
+Your work runs on a server, you read the bar on a laptop. On the server, print what it reads:
+
+```sh
+python -m quotapilot snapshot            # JSON on stdout, --source NAME, --samples FILE
+```
+
+On the laptop, merge the server's snapshot with a local one and get the forecast:
+
+```sh
+python -m quotapilot read --source 'ssh box python -m quotapilot snapshot' --source laptop.json
+```
+
+Each `--source` is a snapshot file, or a shell command that prints one. The freshest reading per
+account wins, the server's samples count in the pace (`--pace` overrides it), and a last good
+reading stands 60 minutes (`Config.last_good_max_min`) after a failed fetch. A source that fails
+prints one error line on stderr and exits 2 with nothing on stdout. In Python, use `Snapshot`,
+`merge`, `snapshot_dumps` and `snapshot_loads`.
+
 ## What it does not do
 
 - It does not switch accounts. You (or claude-swap) act on `drain_first`.

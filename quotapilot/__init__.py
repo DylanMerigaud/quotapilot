@@ -13,6 +13,9 @@ from .core import (
     project,
 )
 from .plan import pace_profile, plan_credits
+from .snapshot import Snapshot, merge
+from .snapshot import dumps as snapshot_dumps
+from .snapshot import loads as snapshot_loads
 
 __version__ = "0.4.0"
 
@@ -20,13 +23,17 @@ __all__ = [
     "Account",
     "Config",
     "Credit",
+    "Snapshot",
     "advise_credits",
     "average_pace",
     "decide",
     "forecast",
+    "merge",
     "pace_band",
     "pace_from_history",
     "pace_profile",
     "plan_credits",
     "project",
+    "snapshot_dumps",
+    "snapshot_loads",
 ]

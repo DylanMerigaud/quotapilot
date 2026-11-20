@@ -14,7 +14,8 @@ class Account:
     """One account and its quota windows, as percent used and the reset instant.
 
     The primary window is the weekly one. The secondary window is a second, narrower window some
-    providers have (for example a per-model weekly limit).
+    providers have (for example a per-model weekly limit). `fetched_at` is when the provider was
+    read; `stale` marks a last good reading kept past a failed fetch.
     """
 
     name: str
@@ -23,6 +24,8 @@ class Account:
     secondary_pct: float | None = None
     secondary_reset: datetime | None = None
     usable: bool = True
+    fetched_at: datetime | None = None  # when this reading was fetched from the provider
+    stale: bool = False  # a last good reading kept past a failed fetch
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class Config:
     profile_min_days: float = 3.0
     profile_floor: float = 0.05
     credit_semantics: str = "keep_date"  # or "restart_window"
+    last_good_max_min: float = 60  # minutes a last good reading stands after a failed fetch
 
 
 DEFAULT = Config()
